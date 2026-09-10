@@ -1,0 +1,31 @@
+# The schema is the product, so it is linted and held to its own history the way
+# the Rust is. See README.md.
+version: v2
+
+modules:
+  - path: proto
+
+lint:
+  # BASIC rather than STANDARD, plus the two rules from STANDARD worth keeping.
+  #
+  # STANDARD adds naming opinions this schema does not share: it wants every
+  # service suffixed `Service`, and every call's response named after the call.
+  # `Scans` reads better than `ScansService`, and `Watch` and `Get` both answer
+  # with a `ScanState`, which is the truth about them rather than an accident to
+  # be papered over with a `GetResponse` alias.
+  #
+  # The two kept rules are not opinions about taste. ENUM_VALUE_PREFIX is what
+  # keeps two enums in one package from claiming the same value name, and
+  # ENUM_ZERO_VALUE_SUFFIX is what makes an unset field distinguishable from a
+  # field set to the first thing anybody happened to declare.
+  use:
+    - BASIC
+    - ENUM_VALUE_PREFIX
+    - ENUM_ZERO_VALUE_SUFFIX
+
+breaking:
+  # Compared against the default branch on every pull request. A field renumbered
+  # or a name reused is a client somewhere reading one thing as another, and it
+  # is silent, which is why a machine checks rather than a reviewer.
+  use:
+    - FILE

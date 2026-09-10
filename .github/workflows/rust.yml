@@ -1,0 +1,39 @@
+name: rust
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      # Both repositories, side by side, because this crate builds against the
+      # engine on disk beside it rather than a published version. The two paths
+      # are what `../zond-engine` in Cargo.toml resolves to.
+      - uses: actions/checkout@v4
+        with:
+          path: zond-daemon
+
+      - uses: actions/checkout@v4
+        with:
+          repository: zond-rs/zond-engine
+          path: zond-engine
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - run: cargo fmt --check
+        working-directory: zond-daemon
+      - run: cargo clippy --all-targets -- -D warnings
+        working-directory: zond-daemon
+      - run: cargo test
+        working-directory: zond-daemon

@@ -1,0 +1,10 @@
+/target/
+**/*.rs.bk
+*.swp
+.idea/
+.DS_Store
+
+# Design records and point-in-time assessments, written for whoever is working
+# on the daemon. Working notes rather than documentation, and nobody's business
+# but this machine's.
+/audit/

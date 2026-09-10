@@ -1,0 +1,325 @@
+// Copyright (c) 2026 Erik Lening (hollowpointer) and Contributors
+//
+// This file is part of Zond Daemon, licensed under the GNU Affero General
+// Public License, version 3 or later. See the LICENSE file for details, or
+// <https://www.gnu.org/licenses/agpl-3.0.html>.
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+syntax = "proto3";
+
+package zond.v1;
+
+// Driving one scan from outside the process.
+//
+// Four calls, which is the whole of what a front end needs: start a scan, follow
+// it, ask where it got to, stop it. Everything else a caller might want, reading
+// an archived scan or comparing two, is the same engine reached the same way and
+// is added here when something asks for it rather than in advance.
+service Scans {
+  // Starts a scan and answers with its identity.
+  //
+  // Returns as soon as the scan is accepted, not when it finishes. A scan of a
+  // /16 runs for hours and a call that waited for it would be a call nothing
+  // could hold open.
+  rpc Start(StartRequest) returns (StartResponse);
+
+  // Follows a scan from a cursor: what it has found so far, then the live tail.
+  //
+  // A cursor rather than a subscription that only runs forward from now, so a
+  // client that reconnects resumes where it stopped instead of starting blind.
+  // A scan that finished last week answers this as readily as one still running,
+  // the journal being the durable form of the same log.
+  rpc Watch(WatchRequest) returns (stream Event);
+
+  // Where a scan has got to, as one answer rather than a stream.
+  rpc Get(GetRequest) returns (ScanState);
+
+  // Winds a scan down.
+  //
+  // Stopping is not cancelling. The scan keeps what it has already found and
+  // still writes its report, and the report says it was stopped.
+  rpc Stop(StopRequest) returns (ScanState);
+}
+
+// ── Starting ────────────────────────────────────────────────────────────────
+
+// What to scan, and how.
+//
+// The wire form of `zond_engine::import::request::ScanRequest`, field for field,
+// so a request document written for the engine's own reader is a valid body here
+// and the two cannot drift apart. The engine's reader refuses an unknown key
+// rather than warning about it, and so does this.
+message StartRequest {
+  // Addresses, ranges, CIDR blocks, hostnames, or the names this host knows:
+  // `lan`, `%en0`. The engine's target grammar, unchanged.
+  repeated string targets = 1;
+
+  // Addresses the scan may not record a finding against, in the same grammar.
+  repeated string exclude = 2;
+
+  // Ports, written as the engine writes them: `22,80,443`, `1-1024,8080`, `-`
+  // for all of them. Absent leaves the engine's own default list.
+  optional string ports = 3;
+
+  optional ServiceDetection service_detection = 4;
+  optional OsDetection os_detection = 5;
+
+  // The most a detection may do to a target. Absent runs none of them.
+  optional DetectionEnvelope detection = 6;
+
+  optional bool traceroute = 7;
+  optional bool characterise = 8;
+  optional bool icmp_evidence = 9;
+
+  // Scans every target without asking first whether anything is there, for a
+  // host behind a firewall that answers no knock.
+  optional bool assume_up = 10;
+
+  // IP protocol numbers to probe for, for a scan asking which protocols a host
+  // speaks rather than which ports it listens on.
+  repeated uint32 ip_protocols = 11;
+
+  // The address to send from, for a host whose default route is not the way to
+  // the target. More than one covers both families.
+  repeated string send_source = 12;
+
+  optional Evasion evasion = 13;
+
+  // The knobs worth setting once and keeping. A settings file on the daemon's
+  // own host is read first, and anything named here overrides it for this run.
+  optional Settings settings = 14;
+}
+
+message StartResponse {
+  // The scan's identity, which is also its journal's. Crockford base32, so it
+  // survives being read aloud and written down.
+  string scan_id = 1;
+}
+
+// How hard the engine works to name what is behind an open port.
+enum ServiceDetection {
+  SERVICE_DETECTION_UNSPECIFIED = 0;
+  SERVICE_DETECTION_OFF = 1;
+  SERVICE_DETECTION_LIGHT = 2;
+  SERVICE_DETECTION_BALANCED = 3;
+  SERVICE_DETECTION_THOROUGH = 4;
+}
+
+// Whether the engine asks a host what it is running on, and how loudly.
+enum OsDetection {
+  OS_DETECTION_UNSPECIFIED = 0;
+  OS_DETECTION_OFF = 1;
+  OS_DETECTION_PASSIVE = 2;
+  OS_DETECTION_ACTIVE = 3;
+  OS_DETECTION_AGGRESSIVE = 4;
+}
+
+// The most a detection is permitted to do to a target.
+//
+// Ordered by what it costs the target rather than by what it finds. A caller
+// scanning somebody else's network picks the ceiling they are authorised to
+// reach and the engine runs nothing above it.
+enum DetectionEnvelope {
+  DETECTION_ENVELOPE_UNSPECIFIED = 0;
+  DETECTION_ENVELOPE_NONE = 1;
+  DETECTION_ENVELOPE_SAFE = 2;
+  DETECTION_ENVELOPE_INTRUSIVE = 3;
+  DETECTION_ENVELOPE_EXPLOIT = 4;
+}
+
+// What a probe looks like on the wire, for a scan that would rather not look
+// like every other scan.
+message Evasion {
+  optional uint32 source_port = 1;
+  optional uint32 ttl = 2;
+  optional uint32 fragment_mtu = 3;
+  optional uint32 padding = 4;
+}
+
+// The knobs worth setting once, rather than per run.
+message Settings {
+  optional ScanEffort effort = 1;
+  // Seconds a host gets before the scan leaves it.
+  optional uint32 host_timeout = 2;
+  // Seconds the whole scan gets before it winds itself down.
+  optional uint32 scan_timeout = 3;
+  optional uint32 max_probe_rate = 4;
+  optional uint32 min_probe_rate = 5;
+  optional uint32 max_attempts = 6;
+  optional bool no_dns = 7;
+  optional bool redact = 8;
+  optional bool tls_enumeration = 9;
+}
+
+enum ScanEffort {
+  SCAN_EFFORT_UNSPECIFIED = 0;
+  SCAN_EFFORT_POLITE = 1;
+  SCAN_EFFORT_BALANCED = 2;
+  SCAN_EFFORT_AGGRESSIVE = 3;
+}
+
+// ── Following ───────────────────────────────────────────────────────────────
+
+message WatchRequest {
+  string scan_id = 1;
+
+  // Where to resume. Zero asks for a compacted snapshot of every host as it
+  // now stands, followed by the live tail, which is what a client opening the
+  // scan for the first time wants. Anything else asks for what happened after
+  // that sequence number and nothing before it.
+  uint64 from_seq = 2;
+}
+
+// One thing that happened, in the order it happened.
+message Event {
+  // Its place in the scan's log. Contiguous per scan, and what a client hands
+  // back to Watch to resume.
+  uint64 seq = 1;
+
+  oneof body {
+    HostChanged host = 2;
+    StageChanged stage = 3;
+    Progress progress = 4;
+    ScannerFailed failure = 5;
+    Finished finished = 6;
+  }
+}
+
+// A host, as it now stands.
+//
+// ## Why the host is a document rather than a message
+//
+// The host travels as the JSON that `zond-report-v1` already describes, rather
+// than as a second description of the same thing written in proto. That schema
+// is published, versioned, and held to the engine's output by a conformance test
+// on every build. A proto mirror of it would be a second contract for one
+// document, maintained by hand, and the two would disagree the first time either
+// moved.
+//
+// A consumer that wants types for it generates them from the schema, the same
+// way it generates these messages from this file. One contract per thing, each
+// in the form that thing is already written in.
+message HostChanged {
+  // The address the engine keys the host under, bracketed if it is IPv6 with a
+  // port, and carrying its zone if it is link-local.
+  string address = 1;
+
+  // One host, shaped as `zond-report-v1` shapes one.
+  string document = 2;
+}
+
+// The scan has moved on to another kind of work.
+//
+// A scan is not one uniform stretch: the sweep settles its plan and then
+// services, detections, operating systems and paths are read off what it found,
+// and that tail routinely takes several times as long as the sweep did.
+message StageChanged {
+  Stage stage = 1;
+}
+
+enum Stage {
+  STAGE_UNSPECIFIED = 0;
+  STAGE_DISCOVERY = 1;
+  STAGE_PORTS = 2;
+  STAGE_SERVICES = 3;
+  STAGE_DETECTIONS = 4;
+  STAGE_TLS = 5;
+  STAGE_OS = 6;
+  STAGE_TRACEROUTE = 7;
+  STAGE_LISTENING = 8;
+  STAGE_FINISHING = 9;
+}
+
+// How far along the scan is.
+//
+// Two reckonings, because they answer different questions. `stage_done` against
+// `stage_total` is how far through the work in hand; `overall_done` against
+// `overall_total` is how far through the run, across every stage it expects to
+// reach. A figure of the first kind alone starts over at every stage boundary.
+message Progress {
+  Stage stage = 1;
+
+  // Within the current stage. Absent where the stage could not be sized before
+  // it began, which is a stage running with no end in sight rather than one that
+  // has not started.
+  optional uint64 stage_done = 2;
+  optional uint64 stage_total = 3;
+
+  // Across the run. Absent for a scan whose stages could not be predicted.
+  optional uint64 overall_done = 4;
+  optional uint64 overall_total = 5;
+}
+
+// A strategy failed to start or ended abnormally.
+//
+// The scan carries on with whatever strategies remain, so results are incomplete
+// rather than absent, and the report keeps every one of these whether or not
+// anybody was listening.
+message ScannerFailed {
+  string scanner = 1;
+  string reason = 2;
+}
+
+// The scan is over.
+message Finished {
+  StopCause cause = 1;
+}
+
+// Why a scan stopped.
+//
+// A report that called an expired budget an abort would say somebody stopped a
+// scan that stopped itself, which is a claim about a person that nothing
+// observed.
+enum StopCause {
+  STOP_CAUSE_UNSPECIFIED = 0;
+  // It ran out of work, which is the ordinary end.
+  STOP_CAUSE_COMPLETED = 1;
+  // A caller asked it to stop.
+  STOP_CAUSE_ABORTED = 2;
+  // Its wall-clock budget ran out.
+  STOP_CAUSE_TIMED_OUT = 3;
+}
+
+// ── Asking and stopping ─────────────────────────────────────────────────────
+
+message GetRequest {
+  string scan_id = 1;
+}
+
+message StopRequest {
+  string scan_id = 1;
+}
+
+// What a scan has found and where it has got to.
+message ScanState {
+  string scan_id = 1;
+
+  // Whether it is still going.
+  bool running = 2;
+
+  // Set once the scan is over.
+  optional StopCause cause = 3;
+
+  Progress progress = 4;
+
+  // The highest sequence number the scan's log holds, which is where a client
+  // that wants only what happens next starts watching from.
+  uint64 seq = 5;
+
+  // The finished report, shaped as `zond-report-v1` shapes one, and absent while
+  // the scan is still running. See `HostChanged` for why it is a document.
+  optional string report = 6;
+}
+
+// ── Failing ─────────────────────────────────────────────────────────────────
+
+// Why a call could not be answered.
+//
+// `code` is the engine's own stable name for the failure, `scan.wrong_phase` or
+// `request.no_targets`, and is what a client branches on. `message` is written
+// for a person and is free to be reworded between releases.
+message Error {
+  string code = 1;
+  string message = 2;
+}

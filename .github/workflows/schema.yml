@@ -1,0 +1,36 @@
+name: schema
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # The schema is a contract with every client generated from it, in languages
+  # this repository does not build. Nothing else in CI can see those, so this is
+  # the only thing standing between a renumbered field and a consumer reading one
+  # value as another.
+  buf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # `buf breaking` compares against the base branch, which it cannot do
+          # from a shallow clone of one commit.
+          fetch-depth: 0
+
+      - uses: bufbuild/buf-setup-action@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Lint
+        run: buf lint
+
+      - name: Breaking changes
+        # Only on a pull request: a push to main has already been through this,
+        # and comparing main against itself compares nothing.
+        if: github.event_name == 'pull_request'
+        run: buf breaking --against "https://github.com/${{ github.repository }}.git#branch=${{ github.base_ref }}"

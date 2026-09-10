@@ -1,0 +1,38 @@
+[package]
+name = "zond-daemon"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/zond-rs/zond-daemon"
+homepage = "https://zond.rs"
+description = "Drives Zond Engine scans over a wire protocol, so a front end in any language can start a scan, follow it live, and stop it."
+
+[[bin]]
+name = "zondd"
+path = "src/main.rs"
+
+[dependencies]
+# The scanner. `import-request` is the type this crate's `StartRequest` is the
+# wire form of, and `import-settings` is what a request's settings table is.
+clap = { version = "4.6.6", features = ["derive"] }
+# The protocol's generated types. Only the messages: nothing generates service
+# stubs yet, the first transport having no use for them.
+prost = "0.14.4"
+# The wire format the first transport frames these messages in, and the JSON the
+# engine already writes its hosts and reports as.
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+# The runtime the engine's scans already run on, plus the standard-input and
+# standard-output halves the first transport reads and writes.
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "sync", "signal"] }
+tracing = "0.1.44"
+zond-engine = { version = "0.15.0", path = "../zond-engine", features = ["import-request", "import-settings"] }
+
+[build-dependencies]
+# A protobuf compiler in the dependency tree rather than one expected on the
+# machine. A build that needs a system `protoc` is a build that works where it
+# was written; this one works wherever cargo does.
+prost-build = "0.14.4"
+protox = "0.9.1"
