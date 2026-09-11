@@ -17,10 +17,28 @@ permissions:
   contents: read
   packages: write
 
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
 jobs:
-  publish:
-    name: Build and publish
-    runs-on: ubuntu-latest
+  # One native runner per architecture, rather than one runner emulating the
+  # other. A scanner is deployed on small arm boxes as readily as on amd64 ones,
+  # and the first machine that tried to pull this image was an arm64 laptop that
+  # could not. Emulating a Rust release build through qemu is the slow way to
+  # reach the same place; GitHub gives public repositories an arm runner.
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
 
     steps:
       # Both repositories, side by side, because this crate builds against the
@@ -44,24 +62,70 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Pushed by digest and left unnamed. A tag written here would be written
+      # twice, once per architecture, and the second would take it from the
+      # first; the job below names the two of them together instead.
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: zond-daemon/Dockerfile
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Hand the digest on
+        run: |
+          mkdir -p /tmp/digests
+          digest='${{ steps.build.outputs.digest }}'
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          retention-days: 1
+
+  # The two builds, named as one image. A client asks for the tag and the
+  # registry hands it whichever of the two its machine can run.
+  publish:
+    name: Publish the manifest
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - id: named
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ env.IMAGE }}
           # `0.1.0` and `0.1`, and no `latest`: an image that moves under a tag
           # somebody deployed is one they cannot reproduce.
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
 
-      # The context is the workspace, which holds both checkouts, and the
-      # dockerfile is named inside one of them. One architecture, the runner's:
-      # building the other under emulation costs more than it is worth until
-      # somebody asks for it.
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: zond-daemon/Dockerfile
-          push: true
-          tags: ${{ steps.named.outputs.tags }}
-          labels: ${{ steps.named.outputs.labels }}
+      - name: Name the two builds as one image
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.IMAGE }}@sha256:%s ' *)
+
+      # What a client will actually be handed, read back from the registry
+      # rather than assumed. An image list missing an architecture is the defect
+      # this job exists to prevent, and it is one line to check for.
+      - name: Read it back
+        run: docker buildx imagetools inspect ${{ env.IMAGE }}:${{ steps.named.outputs.version }}
