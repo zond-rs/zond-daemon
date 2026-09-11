@@ -37,6 +37,11 @@
 //! not, and must not be relied on to: every request is answered on a task of its
 //! own, so a `watch` that runs for the length of a scan holds nothing else up
 //! and two scans can be started without the second waiting on the first.
+//!
+//! Closing the input says there is nothing more to ask, not that the answers
+//! already being written should be dropped. So a client may write its requests,
+//! close its end, and read ours until it closes, which is what a shell pipeline
+//! does and what any client that is not holding a conversation will do.
 
 use std::sync::Arc;
 
@@ -88,6 +93,11 @@ where
     let mut lines = input.lines();
     let out: Out<W> = Arc::new(Mutex::new(output));
 
+    // Held so the loop can wait for them. Standard input closing means the
+    // client has no more to ask, not that the answers to what it already asked
+    // are abandoned: it closes its end and then reads until ours closes too.
+    let mut answering = tokio::task::JoinSet::new();
+
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
             continue;
@@ -105,10 +115,15 @@ where
 
         let scans = scans.clone();
         let out = out.clone();
-        tokio::spawn(async move {
+        answering.spawn(async move {
             let _ = answer(&scans, &out, request).await;
         });
     }
+
+    // Everything still being answered, including a watch that runs for the
+    // length of a scan. A client that asked to follow one and is still reading
+    // is a client this process is still talking to.
+    while answering.join_next().await.is_some() {}
 
     Ok(())
 }
@@ -135,6 +150,10 @@ async fn answer<W: AsyncWrite + Unpin>(
                 scan.stop();
                 frame(out, json!({"id": id, "result": scan.state()})).await
             }
+            Err(refused) => fail(out, id, &refused).await,
+        },
+        "detections" => match detections() {
+            Ok(corpus) => frame(out, json!({"id": id, "result": corpus})).await,
             Err(refused) => fail(out, id, &refused).await,
         },
         "resume" => match resume(scans, request.params).await {
@@ -176,6 +195,31 @@ async fn start(scans: &Scans, params: Value) -> Result<proto::StartResponse, Err
 
     Ok(proto::StartResponse {
         scan_id: scan.id.clone(),
+    })
+}
+
+/// What a scan would check for, without scanning anything.
+///
+/// The corpus this build ships, which is fixed at compile time, so there is
+/// nothing in the request to read and nothing about the daemon's own state in
+/// the answer.
+fn detections() -> Result<proto::DetectionsResponse, Error> {
+    let corpus = zond_engine::detect::Detections::embedded();
+
+    Ok(proto::DetectionsResponse {
+        detections: corpus
+            .listing()
+            .into_iter()
+            .map(|entry| proto::Detection {
+                id: entry.id,
+                title: entry.title,
+                version: entry.version,
+                content_hash: entry.content_hash,
+                tier: crate::convert::detection_tier(entry.tier) as i32,
+                class: crate::convert::detection_effect(entry.class) as i32,
+                gate: Some(crate::convert::gate(&entry.gate)),
+            })
+            .collect(),
     })
 }
 
@@ -781,6 +825,70 @@ mod tests {
         );
 
         scan.stop();
+    }
+
+    /// The corpus comes back described rather than merely counted.
+    ///
+    /// Every entry carries a tier and a class the schema has a name for, and a
+    /// gate carrying what it is gated on. A build that shipped a detection this
+    /// schema could not describe would show it here as unspecified, which is the
+    /// thing the round trips in `convert` exist to stop reaching a client.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_corpus_comes_back_described() {
+        let mut client = Client::connect(Arc::new(Scans::recording_in(None)));
+
+        client.send(json!({"id": 1, "method": "detections"})).await;
+        let listed = client.next().await;
+
+        let corpus = listed["result"]["detections"]
+            .as_array()
+            .unwrap_or_else(|| panic!("a corpus: {listed}"));
+
+        assert!(!corpus.is_empty(), "this build ships detections");
+
+        for entry in corpus {
+            let id = entry["id"].as_str().unwrap_or_default();
+
+            assert!(!id.is_empty(), "every detection is named: {entry}");
+            assert_ne!(
+                entry["tier"], "DETECTION_TIER_UNSPECIFIED",
+                "{id} is written at a tier the schema cannot name"
+            );
+            assert_ne!(
+                entry["class"], "DETECTION_CLASS_UNSPECIFIED",
+                "{id} does something to a target the schema cannot name"
+            );
+            assert!(
+                entry["gate"]["port"].is_object() || entry["gate"]["host"].is_object(),
+                "{id} is gated on something the schema cannot say: {}",
+                entry["gate"]
+            );
+        }
+    }
+
+    /// The cheapest class is refused as a ceiling, and told why.
+    ///
+    /// Reading it as "no detections" is the quiet wrong answer: the caller meant
+    /// something and would have got a scan that ran none, with nothing said.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_cheapest_class_is_refused_as_a_ceiling() {
+        let frames = exchange(&[json!({
+            "id": 1,
+            "method": "start",
+            "params": {"targets": ["127.0.0.1"], "detection": "DETECTION_CLASS_DERIVED"}
+        })])
+        .await;
+
+        assert_eq!(
+            frames[0]["error"]["code"], "request.not_a_ceiling",
+            "{frames:?}"
+        );
+        assert!(
+            frames[0]["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("DETECTION_CLASS_DERIVED")),
+            "the refusal names what was refused: {frames:?}"
+        );
     }
 
     /// A method nobody wrote is refused by name, under the id that asked.

@@ -72,6 +72,12 @@ service Scans {
 
   // Several scans folded into one report.
   rpc Merge(MergeRequest) returns (ExportResponse);
+
+  // What a scan would check for, without scanning anything.
+  //
+  // The corpus this build ships. A caller reads it to know what a detection
+  // envelope is letting in before it lets it in.
+  rpc Detections(DetectionsRequest) returns (DetectionsResponse);
 }
 
 // ── Starting ────────────────────────────────────────────────────────────────
@@ -175,6 +181,18 @@ enum DetectionClass {
   DETECTION_CLASS_UNSPECIFIED = 0;
   // Reads what the scan already gathered. Sends nothing of its own.
   DETECTION_CLASS_PASSIVE = 1;
+  // Sends nothing and reads nothing new: everything it concludes is a
+  // recombination of what the scan already settled.
+  //
+  // Cheaper to the target than anything else here, and **not a ceiling**. A
+  // request naming it in `StartRequest.detection` is refused, because permitting
+  // anything at all already permits this, so naming it says nothing a caller
+  // could have meant. It appears as the class of a detection in
+  // `Detections`, which is the question it answers.
+  //
+  // Numbered last because these numbers are names and not an order. The order is
+  // the one the comments describe, and `DERIVED` sits below `PASSIVE` in it.
+  DETECTION_CLASS_DERIVED = 6;
   // Asks the service a question it is meant to answer.
   DETECTION_CLASS_ACTIVE_BENIGN = 2;
   // Changes something on the target, however small.
@@ -605,6 +623,74 @@ message MergeRequest {
   ExportFormat format = 2;
 
   optional bool redact = 3;
+}
+
+// ── What a scan would check for ─────────────────────────────────────────────
+
+message DetectionsRequest {}
+
+message DetectionsResponse {
+  repeated Detection detections = 1;
+}
+
+// One check a scan can run against what it finds.
+message Detection {
+  string id = 1;
+  string title = 2;
+  string version = 3;
+
+  // What the detection's own content hashes to. Two builds of one id that hash
+  // alike are the same check; two that do not are not, whatever the version
+  // says.
+  string content_hash = 4;
+
+  DetectionTier tier = 5;
+
+  // What running this one does to the target, which is the thing a ceiling is
+  // compared against.
+  DetectionClass class = 6;
+
+  // What has to be true of a thing before this is asked of it.
+  Gate gate = 7;
+}
+
+// How a detection is written, which decides what it is allowed to do.
+enum DetectionTier {
+  DETECTION_TIER_UNSPECIFIED = 0;
+  // Steps and matches, carrying no code.
+  DETECTION_TIER_FLOW = 1;
+  // A sandboxed module, reaching the network only through granted verbs.
+  DETECTION_TIER_COMPUTE = 2;
+  // A correlation across the ports of one host, sending nothing.
+  DETECTION_TIER_HOST = 3;
+}
+
+// What has to be true before a detection is asked of something.
+message Gate {
+  oneof against {
+    // Asked of a port that matches.
+    PortGate port = 1;
+    // Asked of a host once, rather than of each of its ports.
+    HostGate host = 2;
+  }
+}
+
+// A port this detection is worth asking. A field left out matches anything;
+// fields set together all have to hold.
+message PortGate {
+  optional string service = 1;
+  repeated string services = 2;
+  optional uint32 port = 3;
+  repeated uint32 ports = 4;
+  optional string protocol = 5;
+  // The protocol the detection speaks to the port in, `tls` or `http`.
+  optional string speaks = 6;
+}
+
+// A host worth asking, by what was found open on it.
+message HostGate {
+  repeated uint32 ports_open = 1;
+  repeated string services = 2;
 }
 
 // ── Failing ─────────────────────────────────────────────────────────────────

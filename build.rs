@@ -28,6 +28,16 @@ use std::path::PathBuf;
 /// Every field whose type is an enum, and the codec module that writes it by
 /// name. `optional` in the path is the variant for a field the schema marked
 /// `optional`, which the generated code carries as an `Option<i32>`.
+/// Every oneof, and the two attributes that make one read as the schema writes
+/// it.
+///
+/// The generated oneof is a Rust enum, and serde writes one as a map keyed by
+/// the variant's Rust name, so an event would arrive as
+/// `{"body":{"StageChanged":…}}`. Flattened and renamed it arrives as
+/// `{"seq":3,"stage":…}`, which is the name the schema gives that arm and the
+/// one a reader of the schema goes looking for.
+const ONEOFS: &[&str] = &["zond.v1.Event.body", "zond.v1.Gate.against"];
+
 /// Every message whose fields may be left out of a request or a frame.
 ///
 /// `Event` is not among them. It is written by this process rather than read
@@ -60,6 +70,12 @@ const DEFAULTED: &[&str] = &[
     "zond.v1.DiffRequest",
     "zond.v1.DiffResponse",
     "zond.v1.MergeRequest",
+    "zond.v1.DetectionsRequest",
+    "zond.v1.DetectionsResponse",
+    "zond.v1.Detection",
+    "zond.v1.Gate",
+    "zond.v1.PortGate",
+    "zond.v1.HostGate",
 ];
 
 const ENUM_FIELDS: &[(&str, &str)] = &[
@@ -93,6 +109,8 @@ const ENUM_FIELDS: &[(&str, &str)] = &[
     ("zond.v1.DiffRequest.format", "diff_format"),
     ("zond.v1.DiffResponse.format", "diff_format"),
     ("zond.v1.MergeRequest.format", "export_format"),
+    ("zond.v1.Detection.tier", "detection_tier"),
+    ("zond.v1.Detection.class", "detection_class"),
     ("zond.v1.ScanListing.hold", "scan_hold"),
 ];
 
@@ -128,12 +146,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `{"body":{"StageChanged":…}}`. Flattened and renamed it arrives as
     // `{"seq":3,"stage":…}`, which is the name the schema gives that arm and the
     // one a reader of the schema goes looking for.
-    config
-        .type_attribute(
-            "zond.v1.Event.body",
-            "#[serde(rename_all = \"snake_case\")]",
-        )
-        .field_attribute("zond.v1.Event.body", "#[serde(flatten)]");
+    for oneof in ONEOFS {
+        config
+            .type_attribute(oneof, "#[serde(rename_all = \"snake_case\")]")
+            .field_attribute(oneof, "#[serde(flatten)]");
+    }
 
     for (field, module) in ENUM_FIELDS {
         config.field_attribute(

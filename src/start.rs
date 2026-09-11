@@ -390,9 +390,24 @@ fn request(wire: proto::StartRequest) -> Result<ScanRequest, Error> {
     asked.service_detection =
         named(wire.service_detection).and_then(crate::convert::service_detection_of);
     asked.os_detection = named(wire.os_detection).and_then(crate::convert::os_detection_of);
-    asked.detection = named(wire.detection)
-        .and_then(crate::convert::detection_class_of)
-        .map(zond_engine::config::envelope::DetectionEnvelope::up_to);
+    asked.detection = match named::<proto::DetectionClass>(wire.detection) {
+        None => None,
+        // The one class a caller can name and mean something by that is still
+        // not a ceiling. Refused rather than read as "no detections", which is
+        // what it would otherwise quietly become.
+        Some(class) if !crate::convert::is_a_ceiling(class) => {
+            return Err(Error::new(
+                "request.not_a_ceiling",
+                format!(
+                    "{} says what a detection does, not the most one may do; \
+                     anything at all already permits it",
+                    class.as_str_name()
+                ),
+            ));
+        }
+        Some(class) => crate::convert::detection_class_of(class)
+            .map(zond_engine::config::envelope::DetectionEnvelope::up_to),
+    };
 
     if !wire.ip_protocols.is_empty() {
         asked.ip_protocols = Some(

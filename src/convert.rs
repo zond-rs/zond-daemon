@@ -20,6 +20,9 @@
 
 use zond_engine::Stage;
 use zond_engine::config::{OsDetection, ScanEffort, ServiceDetection};
+use zond_engine::detect::bundle::Tier;
+use zond_engine::detect::corpus::Gate;
+use zond_engine::detect::manifest::Class;
 use zond_engine::journal::lock::LockState;
 use zond_engine::model::finding::DetectionClass;
 use zond_engine::model::technique::{SctpScanTechnique, TcpScanTechnique};
@@ -120,14 +123,22 @@ pub fn detection_class(class: DetectionClass) -> proto::DetectionClass {
     }
 }
 
-/// What the engine reads the schema's name as.
+/// What the engine reads the schema's name as, where it is being read as a
+/// ceiling.
 ///
 /// `None` is a request that named no ceiling, which runs no detections. That is
 /// the reason the schema has no value meaning none: an absent field already says
 /// it, and a second way to say the same thing is a second thing to get wrong.
+///
+/// `DERIVED` is also `None`, and is the one value a caller could name and mean
+/// something by. It is not a ceiling: a derived detection sends nothing, so
+/// permitting anything at all already permits it, and a ceiling of `DERIVED`
+/// would be a ceiling under the cheapest thing there is. Whoever names it has
+/// made a mistake, and [`is_a_ceiling`] is what tells the two `None`s apart so
+/// they can be told about it rather than quietly given no detections.
 pub fn detection_class_of(named: proto::DetectionClass) -> Option<DetectionClass> {
     match named {
-        proto::DetectionClass::Unspecified => None,
+        proto::DetectionClass::Unspecified | proto::DetectionClass::Derived => None,
         proto::DetectionClass::Passive => Some(DetectionClass::Passive),
         proto::DetectionClass::ActiveBenign => Some(DetectionClass::ActiveBenign),
         proto::DetectionClass::ActiveMutating => Some(DetectionClass::ActiveMutating),
@@ -257,6 +268,101 @@ pub fn scan_hold(lock: &LockState) -> proto::ScanHold {
         LockState::Held { .. } => proto::ScanHold::Held,
         LockState::Crashed { .. } => proto::ScanHold::Crashed,
         _ => proto::ScanHold::Unspecified,
+    }
+}
+
+/// Whether a class is one an envelope can be set to.
+///
+/// Everything but `DERIVED`, which describes a detection that sends nothing and
+/// so is permitted by any ceiling at all. See [`detection_class_of`].
+pub fn is_a_ceiling(named: proto::DetectionClass) -> bool {
+    !matches!(named, proto::DetectionClass::Derived)
+}
+
+/// The schema's name for what running a detection does to its target.
+///
+/// The same scale a ceiling is set on, with one more rung at the cheap end. The
+/// engine keeps them as two types because a ceiling cannot be set to the
+/// cheapest rung and a detection can be written at it, and this is the direction
+/// that reads the wider one.
+pub fn detection_effect(class: Class) -> proto::DetectionClass {
+    match class {
+        Class::Derived => proto::DetectionClass::Derived,
+        Class::Passive => proto::DetectionClass::Passive,
+        Class::ActiveBenign => proto::DetectionClass::ActiveBenign,
+        Class::ActiveMutating => proto::DetectionClass::ActiveMutating,
+        Class::Exploit => proto::DetectionClass::Exploit,
+        Class::Dos => proto::DetectionClass::Dos,
+        _ => proto::DetectionClass::Unspecified,
+    }
+}
+
+/// What the engine reads the schema's name as, for a detection describing
+/// itself.
+pub fn detection_effect_of(named: proto::DetectionClass) -> Option<Class> {
+    match named {
+        proto::DetectionClass::Unspecified => None,
+        proto::DetectionClass::Derived => Some(Class::Derived),
+        proto::DetectionClass::Passive => Some(Class::Passive),
+        proto::DetectionClass::ActiveBenign => Some(Class::ActiveBenign),
+        proto::DetectionClass::ActiveMutating => Some(Class::ActiveMutating),
+        proto::DetectionClass::Exploit => Some(Class::Exploit),
+        proto::DetectionClass::Dos => Some(Class::Dos),
+    }
+}
+
+/// The schema's name for how a detection is written.
+pub fn detection_tier(tier: Tier) -> proto::DetectionTier {
+    match tier {
+        Tier::Flow => proto::DetectionTier::Flow,
+        Tier::Compute => proto::DetectionTier::Compute,
+        Tier::Host => proto::DetectionTier::Host,
+        _ => proto::DetectionTier::Unspecified,
+    }
+}
+
+/// What the engine reads the schema's name as.
+pub fn detection_tier_of(named: proto::DetectionTier) -> Option<Tier> {
+    match named {
+        proto::DetectionTier::Unspecified => None,
+        proto::DetectionTier::Flow => Some(Tier::Flow),
+        proto::DetectionTier::Compute => Some(Tier::Compute),
+        proto::DetectionTier::Host => Some(Tier::Host),
+    }
+}
+
+/// What has to be true of a thing before a detection is asked of it.
+///
+/// One way only. A gate carries values rather than being one, so there is no
+/// list of gates to hold a mapping against the way `Class::ALL` holds the
+/// classes, and nothing reads a gate back off the wire: a caller composing a
+/// corpus writes the detections themselves, which the engine reads in its own
+/// format.
+pub fn gate(gate: &Gate) -> proto::Gate {
+    let against = match gate {
+        Gate::Port(rule) => proto::gate::Against::Port(proto::PortGate {
+            service: rule.service.clone(),
+            services: rule.services.clone(),
+            port: rule.port.map(u32::from),
+            ports: rule.ports.iter().copied().map(u32::from).collect(),
+            protocol: rule.protocol.clone(),
+            speaks: rule.speaks.clone(),
+        }),
+        Gate::Host {
+            ports_open,
+            services,
+        } => proto::gate::Against::Host(proto::HostGate {
+            ports_open: ports_open.iter().copied().map(u32::from).collect(),
+            services: services.clone(),
+        }),
+        // A gate this build has no shape for leaves the field unset, which says
+        // the detection is gated on something the caller cannot see rather than
+        // that it is gated on nothing.
+        _ => return proto::Gate::default(),
+    };
+
+    proto::Gate {
+        against: Some(against),
     }
 }
 
@@ -468,6 +574,88 @@ mod tests {
             scan_hold(&LockState::Crashed { pid: 4321 }),
             proto::ScanHold::Crashed
         );
+    }
+
+    /// Every class a detection can be written at survives the trip to the schema
+    /// and back, including the one no ceiling may name.
+    #[test]
+    fn every_detection_class_a_detection_can_have_survives_the_round_trip() {
+        for class in Class::ALL {
+            let named = detection_effect(class);
+
+            assert_ne!(
+                named,
+                proto::DetectionClass::Unspecified,
+                "a detection may be written at {class:?} and the schema cannot say so"
+            );
+            assert_eq!(detection_effect_of(named), Some(class));
+        }
+    }
+
+    /// The cheapest class is not a ceiling, and the rest are.
+    ///
+    /// A derived detection sends nothing, so any ceiling at all already permits
+    /// it and one set to it would sit under the cheapest thing there is.
+    /// Naming it is a mistake somebody made, and the two ways of reading it as
+    /// `None` have to be told apart before they can be told about it.
+    #[test]
+    fn the_cheapest_class_is_not_a_ceiling() {
+        assert!(!is_a_ceiling(proto::DetectionClass::Derived));
+        assert_eq!(detection_class_of(proto::DetectionClass::Derived), None);
+
+        for ceiling in DetectionClass::ALL {
+            let named = detection_class(ceiling);
+
+            assert!(
+                is_a_ceiling(named),
+                "{ceiling:?} is a ceiling the engine accepts"
+            );
+        }
+    }
+
+    #[test]
+    fn every_detection_tier_survives_the_round_trip() {
+        for tier in Tier::ALL {
+            let named = detection_tier(tier);
+
+            assert_ne!(named, proto::DetectionTier::Unspecified, "{tier:?}");
+            assert_eq!(detection_tier_of(named), Some(tier));
+        }
+    }
+
+    /// A gate keeps what it is gated on, rather than becoming a word.
+    ///
+    /// The values are the whole of what a gate says: which ports, which
+    /// services, what the detection speaks. A gate rendered as a name would say
+    /// only that there is one.
+    #[test]
+    fn a_gate_carries_what_it_is_gated_on() {
+        let host = gate(&Gate::Host {
+            ports_open: vec![80, 443],
+            services: vec!["http".into()],
+        });
+
+        match host.against {
+            Some(proto::gate::Against::Host(host)) => {
+                assert_eq!(host.ports_open, vec![80, 443]);
+                assert_eq!(host.services, vec!["http".to_string()]);
+            }
+            other => panic!("a host gate became {other:?}"),
+        }
+
+        let mut rule = zond_engine::detect::manifest::Rule::default();
+        rule.service = Some("http".into());
+        rule.ports = vec![8080];
+        rule.speaks = Some("tls".into());
+
+        match gate(&Gate::Port(rule)).against {
+            Some(proto::gate::Against::Port(port)) => {
+                assert_eq!(port.service.as_deref(), Some("http"));
+                assert_eq!(port.ports, vec![8080]);
+                assert_eq!(port.speaks.as_deref(), Some("tls"));
+            }
+            other => panic!("a port gate became {other:?}"),
+        }
     }
 
     /// An unset field leaves the engine's own default standing, rather than
