@@ -1,0 +1,55 @@
+# The shape a deployment takes, and the two things people get wrong.
+#
+# 1. The scanner needs the host's own network. A container on a bridge network
+#    has no layer 2 to the LAN: it cannot ARP or NDP, and `lan` resolves to the
+#    container's own subnet rather than the network anybody wanted scanned.
+#
+# 2. It needs raw sockets, and nothing else does. Everything a person touches
+#    runs with no capabilities at all, and reaches the scanner through a socket
+#    in a shared volume.
+#
+# This file describes running the daemon, not building it. `image:` is whatever
+# you build or publish it as.
+services:
+  zondd:
+    image: zond-daemon:latest
+    # The host's own network, which is the whole point. Without it the scanner
+    # sees a container's idea of the network instead of the network.
+    network_mode: host
+    cap_drop: [ALL]
+    cap_add:
+      # Raw sockets: the ARP, NDP, SYN and ICMP that a scan is made of.
+      - NET_RAW
+      # Reading the interface and neighbour tables.
+      - NET_ADMIN
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    command:
+      - --listen=/run/zond/zond.sock
+      - --journal-dir=/var/lib/zond
+      # Where this daemon may be pointed, and where that is written down. Both
+      # are off unless named: say what yours should be.
+      - --allow=10.0.0.0/8
+      - --audit=/var/lib/zond/audit.jsonl
+    volumes:
+      - socket:/run/zond
+      - journals:/var/lib/zond
+
+  # Whatever a person talks to: a web app, an API, a notebook. It holds no
+  # capabilities and has no raw sockets. Everything it can do, it does by asking
+  # the daemon through the socket, which is where the policy is enforced.
+  client:
+    image: your-front-end:latest
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    depends_on: [zondd]
+    environment:
+      ZONDD_SOCKET: /run/zond/zond.sock
+    volumes:
+      - socket:/run/zond
+
+volumes:
+  socket:
+  journals:

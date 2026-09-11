@@ -19,8 +19,6 @@ which only its own language can call. The artefact here is
 implementation of it, and a TypeScript or Go client generated from the same file
 is another consumer on equal terms.
 
-Four calls: start a scan, follow it from a cursor, ask where it got to, stop it.
-
 Hosts and reports travel as the JSON that `zond-report-v1` already describes,
 rather than as a second description of the same documents written in proto. That
 schema is published, versioned, and held to the engine's output by a conformance
@@ -72,16 +70,77 @@ nobody else. A process that can put arbitrary packets on the wire is not one to
 hand to every account on the machine, so sharing it with another container is
 something an operator does on purpose.
 
+## Bounding it
+
+```bash
+zondd --listen /run/zond.sock --allow 10.0.0.0/8 --audit /var/lib/zond/audit.jsonl
+```
+
+A scanner reached over a socket is a scanner whoever holds that socket can aim,
+so where it may be pointed is a setting of the daemon rather than of a request.
+A client that has been taken over can ask for anything; what it gets is still
+what the operator allowed.
+
+`--allow` says where scans may reach and `--deny` says where they may not
+whatever `--allow` said. Either may be given on its own, both are repeatable, and
+a daemon given neither may be pointed anywhere, which is what every scanner does.
+
+The policy is applied to the addresses a request resolved to, never to the words
+it named them with: a hostname resolves to whatever its owner points it at, so a
+policy compared against the text would be one somebody else writes the other half
+of. A request reaching partly outside is refused whole rather than trimmed to
+fit, because a caller who asked for a range and got a scan of part of it has a
+report that says less than they think.
+
+`--audit` writes every scan started and every request refused as one JSON object
+per line. It fails closed: where a log is named and cannot be written, the scan is
+refused, a scan nobody can account for being the one outcome an audit exists to
+prevent.
+
+```json
+{"at":"2026-09-11T17:17:49Z","event":"started","kind":"port_scan","scan_id":"0384HF6YZY000","targets":["127.0.0.1"]}
+{"at":"2026-09-11T17:17:49Z","event":"refused","code":"scope.refused","targets":["192.0.2.0/24"],"detail":"…"}
+```
+
+## In a container
+
+[`deploy/compose.yaml`](deploy/compose.yaml) has the shape, and the two things
+people get wrong. The scanner needs the host's own network, because a container
+on a bridge network has no layer 2 to the LAN and resolves `lan` to its own
+subnet. And it needs raw sockets, which nothing else does: whatever a person
+talks to holds no capabilities at all and reaches the daemon through a socket in
+a shared volume, which is where the policy is enforced.
+
+## An example
+
+[`examples/scan.ts`](examples/scan.ts) is a client in about a hundred lines: no
+port, no TLS, no generated code and no build step.
+
+```bash
+cargo build
+ZONDD=./target/debug/zondd node examples/scan.ts 127.0.0.1
+```
+
+```text
+127.0.0.1 (localhost)
+     22/tcp  ssh OpenSSH 10.3
+         ! openssh 10.3 has 11 known vulnerabilities
+   8080/tcp  http
+         ! CouchDB served its database list without authentication
+```
+
+Nothing in it is particular to TypeScript beyond the types. Any language that
+can start a program and read lines from it does this in about as much code.
+
 ## Status
 
-Pre-release. The schema is pinned and linted, and the conversion between the
-engine's vocabulary and the schema's is covered by tests that walk the engine's
-own lists, so a value added upstream fails a build here rather than reaching a
-client as a number nothing can name.
+Pre-release, and complete against what `zond` itself does: every one of its
+commands is reachable here.
 
-A scan's log lives in memory and goes when the process does. Its durable form is
-the journal the engine already writes, which is what will make watching a scan
-that finished last week the same call as watching one still running.
+The schema is pinned and linted, and the conversion between the engine's
+vocabulary and the schema's is covered by tests that walk the engine's own lists,
+so a value added upstream fails a build here rather than reaching a client as a
+number nothing can name.
 
 ## Building
 
