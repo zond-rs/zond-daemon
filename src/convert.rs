@@ -20,8 +20,10 @@
 
 use zond_engine::Stage;
 use zond_engine::config::{OsDetection, ScanEffort, ServiceDetection};
+use zond_engine::journal::lock::LockState;
 use zond_engine::model::finding::DetectionClass;
 use zond_engine::model::technique::{SctpScanTechnique, TcpScanTechnique};
+use zond_engine::report::ScanKind;
 use zond_engine::scanner::handle::StopCause;
 use zond_engine::transport::probe::SendMode;
 
@@ -222,6 +224,42 @@ pub fn send_mode_of(named: proto::SendMode) -> Option<SendMode> {
     }
 }
 
+/// The schema's name for what a scan was asking.
+pub fn scan_kind(kind: ScanKind) -> proto::ScanKind {
+    match kind {
+        ScanKind::Discovery => proto::ScanKind::Discovery,
+        ScanKind::PortScan => proto::ScanKind::PortScan,
+        ScanKind::Listen => proto::ScanKind::Listen,
+        _ => proto::ScanKind::Unspecified,
+    }
+}
+
+/// What the engine reads the schema's name as.
+pub fn scan_kind_of(named: proto::ScanKind) -> Option<ScanKind> {
+    match named {
+        proto::ScanKind::Unspecified => None,
+        proto::ScanKind::Discovery => Some(ScanKind::Discovery),
+        proto::ScanKind::PortScan => Some(ScanKind::PortScan),
+        proto::ScanKind::Listen => Some(ScanKind::Listen),
+    }
+}
+
+/// The schema's name for who is running a scan.
+///
+/// One way only, and with no list to check itself against: the engine's states
+/// carry a heartbeat and a process id, so there is no array of them to walk the
+/// way [`scan_kind`] walks `ScanKind::ALL`. A state added upstream arrives here
+/// as unspecified, which is the one place in this module that can happen
+/// quietly.
+pub fn scan_hold(lock: &LockState) -> proto::ScanHold {
+    match lock {
+        LockState::Free => proto::ScanHold::Free,
+        LockState::Held { .. } => proto::ScanHold::Held,
+        LockState::Crashed { .. } => proto::ScanHold::Crashed,
+        _ => proto::ScanHold::Unspecified,
+    }
+}
+
 // ╔════════════════════════════════════════════╗
 // ║ ████████╗███████╗███████╗████████╗███████╗ ║
 // ║ ╚══██╔══╝██╔════╝██╔════╝╚══██╔══╝██╔════╝ ║
@@ -393,6 +431,43 @@ mod tests {
             assert_ne!(named, proto::SendMode::Unspecified, "{mode:?}");
             assert_eq!(send_mode_of(named), Some(mode));
         }
+    }
+
+    #[test]
+    fn every_scan_kind_survives_the_round_trip() {
+        for kind in ScanKind::ALL {
+            let named = scan_kind(kind);
+
+            assert_ne!(
+                named,
+                proto::ScanKind::Unspecified,
+                "the engine records {kind:?} and the schema has no name for it"
+            );
+            assert_eq!(scan_kind_of(named), Some(kind));
+        }
+    }
+
+    /// Each lock state has a name of its own, so a scan whose process died is
+    /// not filed beside one that finished.
+    ///
+    /// The difference is what a person acts on: one is done and the other is
+    /// waiting to be continued.
+    #[test]
+    fn a_crashed_scan_is_not_a_free_one() {
+        use std::time::Duration;
+
+        assert_eq!(scan_hold(&LockState::Free), proto::ScanHold::Free);
+        assert_eq!(
+            scan_hold(&LockState::Held {
+                last_beat: Duration::from_secs(1),
+                pid: 1234,
+            }),
+            proto::ScanHold::Held
+        );
+        assert_eq!(
+            scan_hold(&LockState::Crashed { pid: 4321 }),
+            proto::ScanHold::Crashed
+        );
     }
 
     /// An unset field leaves the engine's own default standing, rather than

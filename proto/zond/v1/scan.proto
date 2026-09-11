@@ -46,6 +46,12 @@ service Scans {
   // For a scan that is over. A scan still running has no report to write, and
   // `Watch` is how its findings arrive in the meantime.
   rpc Export(ExportRequest) returns (ExportResponse);
+
+  // The scans this daemon has a record of, newest first.
+  //
+  // Everything it is running, and everything written down where it records,
+  // including scans some earlier process ran.
+  rpc List(ListRequest) returns (ListResponse);
 }
 
 // ── Starting ────────────────────────────────────────────────────────────────
@@ -436,6 +442,64 @@ enum ExportFormat {
   EXPORT_FORMAT_HTML = 4;
   // Nmap's XML, for the pipelines that already read it.
   EXPORT_FORMAT_NMAP_XML = 5;
+}
+
+// ── Finding them again ──────────────────────────────────────────────────────
+
+message ListRequest {
+  // At most this many, newest first. Absent takes the daemon's own default,
+  // which is a hundred.
+  optional uint32 limit = 1;
+}
+
+message ListResponse {
+  repeated ScanListing scans = 1;
+}
+
+// One scan, as much of it as can be said without reading the whole record.
+message ScanListing {
+  string scan_id = 1;
+  ScanKind kind = 2;
+
+  // When it started, RFC 3339.
+  string started_at = 3;
+
+  // What it was for, in a few words, as the record itself puts it.
+  string summary = 4;
+
+  // How many targets the plan held, and how many of them are settled. Absent
+  // where the plan is too large to count, which describes a scan no run
+  // finishes.
+  optional uint64 planned = 5;
+  optional uint64 settled = 6;
+
+  // Whether it reached the end of its plan.
+  bool complete = 7;
+
+  // Who, if anyone, is running it.
+  ScanHold hold = 8;
+}
+
+enum ScanKind {
+  SCAN_KIND_UNSPECIFIED = 0;
+  // Which addresses are alive.
+  SCAN_KIND_DISCOVERY = 1;
+  // Which ports of known hosts are open.
+  SCAN_KIND_PORT_SCAN = 2;
+  // What a link carries, having sent nothing.
+  SCAN_KIND_LISTEN = 3;
+}
+
+// Whether a scan is being run right now, and by what.
+enum ScanHold {
+  SCAN_HOLD_UNSPECIFIED = 0;
+  // Nobody is running it. Finished, or stopped and waiting to be continued.
+  SCAN_HOLD_FREE = 1;
+  // A process is running it now.
+  SCAN_HOLD_HELD = 2;
+  // A process was running it and is gone. Everything it had reached is on
+  // disk, and it can be continued.
+  SCAN_HOLD_CRASHED = 3;
 }
 
 // ── Failing ─────────────────────────────────────────────────────────────────

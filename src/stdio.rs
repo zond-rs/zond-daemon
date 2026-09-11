@@ -137,6 +137,10 @@ async fn answer<W: AsyncWrite + Unpin>(
             }
             Err(refused) => fail(out, id, &refused).await,
         },
+        "list" => match list(scans, request.params) {
+            Ok(listing) => frame(out, json!({"id": id, "result": listing})).await,
+            Err(refused) => fail(out, id, &refused).await,
+        },
         "export" => match export(scans, request.params) {
             Ok(written) => frame(out, json!({"id": id, "result": written})).await,
             Err(refused) => fail(out, id, &refused).await,
@@ -156,6 +160,15 @@ async fn start(scans: &Scans, params: Value) -> Result<proto::StartResponse, Err
 
     Ok(proto::StartResponse {
         scan_id: scan.id.clone(),
+    })
+}
+
+/// The scans this daemon has a record of.
+fn list(scans: &Scans, params: Value) -> Result<proto::ListResponse, Error> {
+    let asked: proto::ListRequest = serde_json::from_value(params).map_err(Error::malformed)?;
+
+    Ok(proto::ListResponse {
+        scans: scans.list(asked.limit)?,
     })
 }
 

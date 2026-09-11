@@ -39,6 +39,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
 
 use zond_engine::export::{ExportOptions, Redaction, schema::HostDto};
+use zond_engine::format::time;
 use zond_engine::journal::store;
 use zond_engine::model::ip::scoped::ScopedIp;
 use zond_engine::report::ScanReport;
@@ -286,6 +287,29 @@ impl Scans {
         Ok(scan)
     }
 
+    /// The scans this daemon has a record of, newest first.
+    ///
+    /// Read off disk rather than out of memory, because what is in memory is
+    /// only what this process happens to have started and the record covers
+    /// every run that ever wrote one, this one's included. A daemon recording
+    /// nothing has nothing to list; a client that started a scan there holds its
+    /// name from the answer that started it.
+    pub fn list(&self, limit: Option<u32>) -> Result<Vec<proto::ScanListing>, Error> {
+        let Some(root) = self.root.as_deref() else {
+            return Ok(Vec::new());
+        };
+
+        let mut entries = store::list(root).map_err(Error::engine)?;
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.manifest.created_at));
+
+        let limit = match limit {
+            Some(0) | None => DEFAULT_LISTING,
+            Some(limit) => usize::try_from(limit).unwrap_or(DEFAULT_LISTING),
+        };
+
+        Ok(entries.into_iter().take(limit).map(listing).collect())
+    }
+
     /// The scan named `id`, whether or not this process is the one running it.
     ///
     /// A scan still going is held here. One that is not is read back out of the
@@ -309,6 +333,12 @@ impl Scans {
         }
     }
 }
+
+/// How many scans a listing that named no limit holds.
+///
+/// Enough that a person looking for one they ran this week finds it, and few
+/// enough that a daemon with years of records does not answer with all of them.
+const DEFAULT_LISTING: usize = 100;
 
 /// A scan this process is running, or one it only has the record of.
 #[derive(Debug, Clone)]
@@ -370,6 +400,28 @@ impl Found {
         if let Found::Live(scan) = self {
             scan.stop();
         }
+    }
+}
+
+/// One recorded scan, as much of it as can be said without reading the whole
+/// record.
+fn listing(entry: store::Entry) -> proto::ScanListing {
+    let kind = convert::scan_kind(entry.kind()) as i32;
+    let hold = convert::scan_hold(&entry.lock) as i32;
+    let complete = entry.is_complete();
+    let settled = entry.settled().and_then(|count| u64::try_from(count).ok());
+
+    proto::ScanListing {
+        scan_id: entry.manifest.id,
+        kind,
+        started_at: time::rfc3339(entry.manifest.created_at),
+        summary: entry.manifest.summary,
+        // Absent rather than clamped where the plan will not fit, which
+        // describes a plan no run finishes.
+        planned: u64::try_from(entry.manifest.total_targets).ok(),
+        settled,
+        complete,
+        hold,
     }
 }
 
@@ -586,6 +638,91 @@ mod tests {
             assume_up: Some(true),
             ..Default::default()
         }
+    }
+
+    /// A directory nothing else in this suite is recording into.
+    fn somewhere() -> PathBuf {
+        std::env::temp_dir().join(format!("zondd-journal-{}", crate::id::mint()))
+    }
+
+    /// Follows a scan to its end, or gives up rather than hanging the suite.
+    async fn finished(scan: &Scan) {
+        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            let mut cursor = 0;
+            loop {
+                let events = scan.after(cursor).await;
+                if events.is_empty() {
+                    return;
+                }
+                cursor = events.last().map(|last| last.seq).unwrap_or(cursor);
+            }
+        })
+        .await
+        .expect("a scan of three loopback ports finishes");
+    }
+
+    /// A scan that has been written down is one a client can find again without
+    /// having kept its name.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recorded_scan_is_in_the_listing_with_what_it_was() {
+        let root = somewhere();
+        let scans = Scans::recording_in(Some(root.clone()));
+
+        let scan = scans.start(loopback()).await.expect("a recorded scan");
+        finished(&scan).await;
+
+        let listed = scans.list(None).expect("a listing");
+        let entry = listed
+            .iter()
+            .find(|entry| entry.scan_id == scan.id)
+            .unwrap_or_else(|| panic!("{} is not in {listed:?}", scan.id));
+
+        assert_eq!(entry.kind, proto::ScanKind::PortScan as i32, "a port scan");
+        assert!(entry.complete, "it reached the end of its plan");
+        assert_eq!(entry.planned, Some(3), "three ports of one host");
+        assert!(
+            entry.started_at.starts_with("20"),
+            "a time a person can read: {}",
+            entry.started_at
+        );
+        assert!(!entry.summary.is_empty(), "and a word about what it was");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Newest first, because the scan somebody is looking for is almost always
+    /// the one they just ran.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_newest_scan_is_listed_first() {
+        let root = somewhere();
+        let scans = Scans::recording_in(Some(root.clone()));
+
+        let first = scans.start(loopback()).await.expect("one scan");
+        finished(&first).await;
+        let second = scans.start(loopback()).await.expect("and a later one");
+        finished(&second).await;
+
+        let listed = scans.list(None).expect("a listing");
+        assert_eq!(listed.len(), 2, "{listed:?}");
+        assert_eq!(listed[0].scan_id, second.id, "the later one leads");
+
+        let asked_for_one = scans.list(Some(1)).expect("a listing of one");
+        assert_eq!(asked_for_one.len(), 1, "a limit is a limit");
+        assert_eq!(asked_for_one[0].scan_id, second.id);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A daemon recording nothing has nothing to list, and says so with an empty
+    /// answer rather than going looking through somebody else's records.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_daemon_that_records_nothing_lists_nothing() {
+        let scans = Scans::recording_in(None);
+        let scan = scans.start(loopback()).await.expect("a scan all the same");
+
+        assert!(scans.list(None).expect("an answer").is_empty());
+
+        scan.stop();
     }
 
     /// A whole scan, followed from a cursor to the end.
