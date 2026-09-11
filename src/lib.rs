@@ -41,6 +41,11 @@
 
 pub mod codec;
 pub mod convert;
+pub mod error;
+pub mod id;
+pub mod scans;
+pub mod start;
+pub mod stdio;
 
 /// The protocol, compiled from `proto/zond/v1/scan.proto`.
 ///
