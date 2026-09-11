@@ -33,15 +33,9 @@
 //! ## What a client may assume
 //!
 //! Frames carrying one `id` arrive in order. Frames carrying different ids do
-//! not, and must not be relied on to: a `watch` runs for as long as the scan
-//! does, so it is followed on a task of its own and everything asked afterwards
-//! is answered while it is still going.
-//!
-//! The other three are answered where they are read. Starting a scan resolves
-//! its targets, and the engine's `TargetContext` carries resolver hooks that are
-//! not `Sync`, so the future that does it cannot be handed to another thread.
-//! Nothing is lost by that: what takes time in a scan is the scan, and a client
-//! that wants to start two at once sends the second after the first is named.
+//! not, and must not be relied on to: every request is answered on a task of its
+//! own, so a `watch` that runs for the length of a scan holds nothing else up
+//! and two scans can be started without the second waiting on the first.
 
 use std::sync::Arc;
 
@@ -108,17 +102,11 @@ where
             }
         };
 
-        // Only a watch outlives the request that asked for it.
-        if request.method == "watch" {
-            let scans = scans.clone();
-            let out = out.clone();
-            tokio::spawn(async move {
-                let _ = watch(&scans, &out, request.id, request.params).await;
-            });
-            continue;
-        }
-
-        answer(&scans, &out, request).await?;
+        let scans = scans.clone();
+        let out = out.clone();
+        tokio::spawn(async move {
+            let _ = answer(&scans, &out, request).await;
+        });
     }
 
     Ok(())
@@ -148,6 +136,7 @@ async fn answer<W: AsyncWrite + Unpin>(
             }
             Err(refused) => fail(out, id, &refused).await,
         },
+        "watch" => watch(scans, out, id, request.params).await,
         other => {
             let refused = Error::no_such_method(other);
             fail(out, id, &refused).await
