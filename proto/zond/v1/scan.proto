@@ -52,6 +52,13 @@ service Scans {
   // Everything it is running, and everything written down where it records,
   // including scans some earlier process ran.
   rpc List(ListRequest) returns (ListResponse);
+
+  // Throws away records this daemon no longer needs.
+  //
+  // A record nothing names is a record of a scan somebody ran once, and a
+  // daemon that keeps every one of them forever fills a disk. This is how an
+  // operator says which are worth keeping.
+  rpc Prune(PruneRequest) returns (PruneResponse);
 }
 
 // ── Starting ────────────────────────────────────────────────────────────────
@@ -97,6 +104,20 @@ message StartRequest {
   repeated string send_source = 12;
 
   optional Evasion evasion = 13;
+
+  // What the scan is asking. Absent asks which ports are open, which is what
+  // most callers want and what every field above is written for.
+  //
+  // A discovery sweep ignores `ports`. A listen ignores `targets` and `ports`
+  // alike and reads `links` instead, having asked nothing of anybody.
+  ScanKind kind = 15;
+
+  // For a listen: the links to watch, named as this host names them, `en0`.
+  repeated string links = 16;
+
+  // For a listen: how long to watch for. Absent watches until stopped, a
+  // listener having no work to run out of.
+  optional uint32 listen_for_seconds = 17;
 
   // The knobs worth setting once and keeping. A settings file on the daemon's
   // own host is read first, and anything named here overrides it for this run.
@@ -500,6 +521,36 @@ enum ScanHold {
   // A process was running it and is gone. Everything it had reached is on
   // disk, and it can be continued.
   SCAN_HOLD_CRASHED = 3;
+}
+
+// ── Throwing them away ──────────────────────────────────────────────────────
+
+// Which records are worth keeping, by age and by whether the scan finished.
+//
+// Both are ages in seconds, and both are optional: a field left out keeps every
+// record of that kind however old. Zero is not "keep nothing missed": it means
+// older than no time at all, which is all of them.
+message PruneRequest {
+  // Records of scans that reached the end of their plan.
+  optional uint32 completed_after_seconds = 1;
+
+  // Records of scans that did not. These are the ones a resume would have
+  // continued, so a caller that keeps anything usually keeps these longer.
+  optional uint32 incomplete_after_seconds = 2;
+}
+
+message PruneResponse {
+  // The scans whose records are gone.
+  repeated string removed = 1;
+
+  // The ones that stayed, and why. A record being used by a running scan is the
+  // ordinary reason, and it is not an error: it will be prunable later.
+  repeated HeldRecord kept = 2;
+}
+
+message HeldRecord {
+  string scan_id = 1;
+  string reason = 2;
 }
 
 // ── Failing ─────────────────────────────────────────────────────────────────

@@ -35,12 +35,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use tokio::sync::Notify;
 
 use zond_engine::export::{ExportOptions, Redaction, schema::HostDto};
 use zond_engine::format::time;
 use zond_engine::journal::store;
+use zond_engine::journal::store::Retention;
 use zond_engine::model::ip::scoped::ScopedIp;
 use zond_engine::report::ScanReport;
 use zond_engine::scanner::handle::ScanHandle;
@@ -308,6 +310,40 @@ impl Scans {
         };
 
         Ok(entries.into_iter().take(limit).map(listing).collect())
+    }
+
+    /// Throws away the records this daemon no longer needs.
+    ///
+    /// A field left out keeps every record of that kind however old, and zero
+    /// means older than no time at all, which is all of them. A record a running
+    /// scan is using stays where it is and comes back in `kept`: it is not an
+    /// error, and it will be prunable once that scan is done.
+    pub fn prune(&self, asked: proto::PruneRequest) -> Result<proto::PruneResponse, Error> {
+        let Some(root) = self.root.as_deref() else {
+            return Ok(proto::PruneResponse::default());
+        };
+
+        let mut retention = Retention::keep_everything();
+        retention.completed_for = asked
+            .completed_after_seconds
+            .map(|seconds| Duration::from_secs(u64::from(seconds)));
+        retention.incomplete_for = asked
+            .incomplete_after_seconds
+            .map(|seconds| Duration::from_secs(u64::from(seconds)));
+
+        let pruned = store::prune(root, &retention).map_err(Error::engine)?;
+
+        Ok(proto::PruneResponse {
+            removed: pruned.removed,
+            kept: pruned
+                .held
+                .into_iter()
+                .map(|held| proto::HeldRecord {
+                    scan_id: held.id,
+                    reason: held.reason,
+                })
+                .collect(),
+        })
     }
 
     /// The scan named `id`, whether or not this process is the one running it.
@@ -723,6 +759,128 @@ mod tests {
         assert!(scans.list(None).expect("an answer").is_empty());
 
         scan.stop();
+    }
+
+    /// A sweep of this machine's own loopback, which asks about addresses and
+    /// never about ports.
+    fn sweeping() -> proto::StartRequest {
+        proto::StartRequest {
+            targets: vec!["127.0.0.1".into()],
+            kind: proto::ScanKind::Discovery as i32,
+            ..Default::default()
+        }
+    }
+
+    /// A sweep runs through the same registry, log and record a port scan does.
+    ///
+    /// The whole point of putting the kind on the request rather than writing a
+    /// second daemon around it: everything downstream of the engine call is the
+    /// same machinery, and this is the test that says so.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sweep_runs_and_is_recorded_as_one() {
+        let root = somewhere();
+        let scans = Scans::recording_in(Some(root.clone()));
+
+        let scan = scans.start(sweeping()).await.expect("a sweep");
+        finished(&scan).await;
+
+        let listed = scans.list(None).expect("a listing");
+        let entry = listed
+            .iter()
+            .find(|entry| entry.scan_id == scan.id)
+            .unwrap_or_else(|| panic!("{} is not in {listed:?}", scan.id));
+
+        assert_eq!(
+            entry.kind,
+            proto::ScanKind::Discovery as i32,
+            "recorded as the sweep it was, not as a port scan"
+        );
+        assert!(entry.summary.contains("address"), "{}", entry.summary);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A sweep of nothing is refused before a packet leaves, exactly as a port
+    /// scan of nothing is.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sweep_of_nothing_is_refused() {
+        let refused = Scans::recording_in(None)
+            .start(proto::StartRequest {
+                kind: proto::ScanKind::Discovery as i32,
+                ..Default::default()
+            })
+            .await
+            .expect_err("a sweep with nothing to sweep");
+
+        assert_eq!(refused.code(), "request.no_targets");
+    }
+
+    /// A listen with no link named is refused, and told what it is missing.
+    ///
+    /// A listener asks nothing of anybody, so targets are not what it is short
+    /// of and saying `no_targets` would send somebody looking in the wrong
+    /// place.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_listen_with_no_link_is_refused_for_the_right_reason() {
+        let refused = Scans::recording_in(None)
+            .start(proto::StartRequest {
+                kind: proto::ScanKind::Listen as i32,
+                ..Default::default()
+            })
+            .await
+            .expect_err("a listen on nothing");
+
+        assert_eq!(refused.code(), "request.no_links");
+        assert!(refused.message().contains("link"), "{refused}");
+    }
+
+    /// A link this host does not have is refused by name.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_link_this_host_does_not_have_is_refused() {
+        let refused = Scans::recording_in(None)
+            .start(proto::StartRequest {
+                kind: proto::ScanKind::Listen as i32,
+                links: vec!["not-an-interface".into()],
+                ..Default::default()
+            })
+            .await
+            .expect_err("a link nobody has");
+
+        assert_eq!(refused.code(), "request.unknown_link");
+    }
+
+    /// Pruning with an age of nothing takes every finished record.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pruning_takes_the_records_it_was_told_to() {
+        let root = somewhere();
+        let scans = Scans::recording_in(Some(root.clone()));
+
+        let scan = scans.start(loopback()).await.expect("a scan");
+        finished(&scan).await;
+        assert_eq!(scans.list(None).expect("a listing").len(), 1);
+
+        // Nothing named, so nothing goes.
+        let kept = scans
+            .prune(proto::PruneRequest::default())
+            .expect("a prune of nothing");
+        assert!(kept.removed.is_empty(), "{kept:?}");
+        assert_eq!(scans.list(None).expect("a listing").len(), 1);
+
+        // Every finished record, however recent.
+        let pruned = scans
+            .prune(proto::PruneRequest {
+                completed_after_seconds: Some(0),
+                ..Default::default()
+            })
+            .expect("a prune");
+
+        assert_eq!(pruned.removed, vec![scan.id.clone()], "{pruned:?}");
+        assert!(
+            scans.list(None).expect("a listing").is_empty(),
+            "and the record is gone"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// A whole scan, followed from a cursor to the end.

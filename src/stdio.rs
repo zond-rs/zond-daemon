@@ -137,6 +137,10 @@ async fn answer<W: AsyncWrite + Unpin>(
             }
             Err(refused) => fail(out, id, &refused).await,
         },
+        "prune" => match prune(scans, request.params) {
+            Ok(pruned) => frame(out, json!({"id": id, "result": pruned})).await,
+            Err(refused) => fail(out, id, &refused).await,
+        },
         "list" => match list(scans, request.params) {
             Ok(listing) => frame(out, json!({"id": id, "result": listing})).await,
             Err(refused) => fail(out, id, &refused).await,
@@ -161,6 +165,13 @@ async fn start(scans: &Scans, params: Value) -> Result<proto::StartResponse, Err
     Ok(proto::StartResponse {
         scan_id: scan.id.clone(),
     })
+}
+
+/// Throws away the records nobody asked to keep.
+fn prune(scans: &Scans, params: Value) -> Result<proto::PruneResponse, Error> {
+    let asked: proto::PruneRequest = serde_json::from_value(params).map_err(Error::malformed)?;
+
+    scans.prune(asked)
 }
 
 /// The scans this daemon has a record of.

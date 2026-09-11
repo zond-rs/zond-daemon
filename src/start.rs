@@ -26,10 +26,13 @@ use zond_engine::import::request::ScanRequest;
 use zond_engine::import::settings::Settings;
 use zond_engine::journal::manifest::Plan;
 use zond_engine::journal::store::{self, Journal};
+use zond_engine::model::ip::set::IpSet;
 use zond_engine::model::parse::target::TargetContext;
 use zond_engine::model::port::PortSet;
 use zond_engine::model::target::TargetMap;
+use zond_engine::report::ScanKind;
 use zond_engine::resolve::{self, Resolver};
+use zond_engine::scanner::ListenScope;
 use zond_engine::system::privilege::Privilege;
 
 use crate::error::Error;
@@ -42,19 +45,32 @@ use crate::scans::{Scan, Started};
 /// about ports gets the scan somebody would have got by typing the command.
 const DEFAULT_TOP_PORTS: usize = 1000;
 
-/// Starts the scan a request describes.
+/// Starts the scan a request describes, of whichever kind it asks for.
 pub async fn scan(wire: proto::StartRequest, root: Option<&Path>) -> Result<Started, Error> {
-    let asked = request(wire)?;
+    let kind = proto::ScanKind::try_from(wire.kind)
+        .ok()
+        .and_then(crate::convert::scan_kind_of)
+        .unwrap_or(ScanKind::PortScan);
 
-    if asked.targets.is_empty() {
-        return Err(Error::new(
-            "request.no_targets",
-            "a scan has to be given something to scan",
-        ));
+    match kind {
+        ScanKind::Discovery => sweep(wire, root).await,
+        ScanKind::Listen => watch(wire, root).await,
+        // Every other kind, which today is the port scan and tomorrow is
+        // whatever the engine learns next. Asking for one this build has no
+        // name for is the same as asking for nothing.
+        _ => ports(wire, root).await,
     }
+}
 
+/// Which of a host's ports are open, and what is behind them.
+async fn ports(wire: proto::StartRequest, root: Option<&Path>) -> Result<Started, Error> {
+    let asked = request(wire)?;
     let mut config = ZondConfig::default();
     asked.apply_to(&mut config);
+
+    if asked.targets.is_empty() {
+        return Err(nothing_to_scan());
+    }
 
     let ports = match asked.ports() {
         Some(Ok(ports)) => ports,
@@ -62,9 +78,7 @@ pub async fn scan(wire: proto::StartRequest, root: Option<&Path>) -> Result<Star
         None => PortSet::top_tcp(DEFAULT_TOP_PORTS),
     };
 
-    // The host's own resolver, unless the request asked for a run that generates
-    // no DNS traffic at all.
-    let resolver = (!config.no_dns).then(Resolver::from_system);
+    let resolver = resolver(&config);
     let context = TargetContext::new();
 
     let map = match &resolver {
@@ -75,25 +89,13 @@ pub async fn scan(wire: proto::StartRequest, root: Option<&Path>) -> Result<Star
             .map_err(Error::engine)?,
     };
 
-    config.exclusions = resolve::for_exclusion(&asked.exclude, resolver.as_ref())
-        .await
-        .map_err(Error::engine)?;
+    config.exclusions = exclusions(&asked.exclude, resolver.as_ref()).await?;
 
-    let redaction = if config.redact {
-        Redaction::Standard
-    } else {
-        Redaction::None
-    };
-
-    // Recorded before it starts, so a scan outlives the process running it and
-    // can be read back by name afterwards. The journal names it; only a run that
-    // could not be recorded falls back to a name of this process's own, and that
-    // name dies with the process exactly as the scan does.
-    let journal = root.and_then(|root| record(root, &map, &config));
-    let id = match &journal {
-        Some(journal) => journal.manifest().id.clone(),
-        None => crate::id::mint(),
-    };
+    let journal = root.and_then(|root| {
+        let plan = Plan::port_scan(&map, &config.exclusions, config.tcp_technique);
+        record(root, &plan, probes(&map))
+    });
+    let id = named_by(&journal);
 
     let (session, task) = match journal {
         Some(journal) => {
@@ -103,13 +105,166 @@ pub async fn scan(wire: proto::StartRequest, root: Option<&Path>) -> Result<Star
     }
     .map_err(Error::engine)?;
 
+    Ok(started(id, session, task, &config))
+}
+
+/// Which addresses are alive.
+///
+/// A sweep asks about addresses and never about ports, so a request's `ports`
+/// is not read here. Everything else it carries applies: the same exclusions,
+/// the same evasion, the same settings.
+async fn sweep(wire: proto::StartRequest, root: Option<&Path>) -> Result<Started, Error> {
+    let asked = request(wire)?;
+    let mut config = ZondConfig::default();
+    asked.apply_to(&mut config);
+
+    if asked.targets.is_empty() {
+        return Err(nothing_to_scan());
+    }
+
+    let resolver = resolver(&config);
+    let targets = resolve::for_discovery(&asked.targets, resolver.as_ref())
+        .await
+        .map_err(Error::engine)?;
+
+    // Before the exclusions, because a sweep's own targets decide whether the
+    // scan sweeps a segment and the plan has to record that.
+    targets.apply_to(&mut config);
+    config.exclusions = exclusions(&asked.exclude, resolver.as_ref()).await?;
+
+    let addresses: IpSet = targets.into_ips();
+
+    let journal = root.and_then(|root| {
+        let plan = Plan::discovery(&addresses, &config.exclusions, config.segment_sweep);
+        record(root, &plan, addresses_in(&addresses))
+    });
+    let id = named_by(&journal);
+
+    let (session, task) = match journal {
+        Some(journal) => zond_engine::discover_with_journal(addresses, &config, journal).await,
+        None => zond_engine::discover(addresses, &config).await,
+    }
+    .map_err(Error::engine)?;
+
+    Ok(started(id, session, task, &config))
+}
+
+/// What a link carries, having sent nothing.
+///
+/// The one kind that asks nothing of anybody, so it names links rather than
+/// targets and ends when it is told to rather than when the work runs out.
+async fn watch(wire: proto::StartRequest, root: Option<&Path>) -> Result<Started, Error> {
+    let links = wire.links.clone();
+    let listen_for = wire.listen_for_seconds;
+
+    let asked = request(wire)?;
+    let mut config = ZondConfig::default();
+    asked.apply_to(&mut config);
+
+    if links.is_empty() {
+        return Err(Error::new(
+            "request.no_links",
+            "a listen has to be given a link to listen on",
+        ));
+    }
+
+    let zones = resolve::for_listening(&links)
+        .map_err(|refused| Error::new("request.unknown_link", refused.to_string()))?;
+
+    let mut scope = ListenScope::on(zones.clone()).recording_everything();
+    if let Some(seconds) = listen_for {
+        scope = scope.for_at_most(Duration::from_secs(u64::from(seconds)));
+    }
+
+    let journal = root.and_then(|root| {
+        let plan = Plan::listen(zones.clone());
+        record(root, &plan, watching(&links))
+    });
+    let id = named_by(&journal);
+
+    let (session, task) = match journal {
+        Some(journal) => zond_engine::listen_with_journal(scope, &config, journal).await,
+        None => zond_engine::listen(scope, &config).await,
+    }
+    .map_err(Error::engine)?;
+
+    Ok(started(id, session, task, &config))
+}
+
+/// The pieces every kind hands back the same way.
+fn started(
+    id: String,
+    session: zond_engine::ScanSession,
+    task: zond_engine::ScanTask,
+    config: &ZondConfig,
+) -> Started {
+    let redaction = if config.redact {
+        Redaction::Standard
+    } else {
+        Redaction::None
+    };
+
     let (hosts, events, handle, progress) = session.into_parts();
 
-    Ok(Started {
+    Started {
         scan: Scan::new(id, hosts, progress, handle, redaction),
         events,
         task,
-    })
+    }
+}
+
+/// The name the journal gave the scan, or one of this process's own where there
+/// is no journal to give it one.
+fn named_by(journal: &Option<Journal>) -> String {
+    match journal {
+        Some(journal) => journal.manifest().id.clone(),
+        None => crate::id::mint(),
+    }
+}
+
+/// This host's own resolver, unless the run must generate no DNS traffic.
+fn resolver(config: &ZondConfig) -> Option<Resolver> {
+    (!config.no_dns).then(Resolver::from_system)
+}
+
+/// The addresses a scan may not record a finding against.
+async fn exclusions(
+    excluded: &[String],
+    resolver: Option<&Resolver>,
+) -> Result<zond_engine::Exclusions, Error> {
+    resolve::for_exclusion(excluded, resolver)
+        .await
+        .map_err(Error::engine)
+}
+
+/// A scan with nothing to scan.
+fn nothing_to_scan() -> Error {
+    Error::new(
+        "request.no_targets",
+        "a scan has to be given something to scan",
+    )
+}
+
+/// What a person listing their scans sees beside the name.
+fn probes(map: &TargetMap) -> String {
+    match map.gross_targets() {
+        Ok(1) => "1 probe".to_string(),
+        Ok(probes) => format!("{probes} probes"),
+        Err(_) => "a plan too large to count".to_string(),
+    }
+}
+
+/// The same, for a sweep, which is counted in addresses.
+fn addresses_in(addresses: &IpSet) -> String {
+    match addresses.len() {
+        1 => "1 address".to_string(),
+        count => format!("{count} addresses"),
+    }
+}
+
+/// And for a listen, which is counted in neither.
+fn watching(links: &[String]) -> String {
+    format!("listening on {}", links.join(", "))
 }
 
 /// Opens a journal for this scan, or none where the machine will not have one.
@@ -119,7 +274,7 @@ pub async fn scan(wire: proto::StartRequest, root: Option<&Path>) -> Result<Star
 /// that cannot make it this time should not refuse the scan over it. What is
 /// lost is only that the scan cannot be read back once this process is gone,
 /// and the client is told which kind it got by the shape of the name.
-fn record(root: &Path, map: &TargetMap, config: &ZondConfig) -> Option<Journal> {
+fn record(root: &Path, plan: &Plan, summary: String) -> Option<Journal> {
     // Not `create_dir_all`: under `sudo` that leaves the directory owned by
     // root, and every later unprivileged run then finds a journal directory it
     // cannot write to. The engine creates it and gives it away.
@@ -128,23 +283,12 @@ fn record(root: &Path, map: &TargetMap, config: &ZondConfig) -> Option<Journal> 
         return None;
     }
 
-    let plan = Plan::port_scan(map, &config.exclusions, config.tcp_technique);
-
-    match Journal::create(root, &plan, Privilege::current(), summarise(map)) {
+    match Journal::create(root, plan, Privilege::current(), summary) {
         Ok(journal) => Some(journal),
         Err(refused) => {
             tracing::warn!("not recording this scan: {refused}");
             None
         }
-    }
-}
-
-/// What a person listing their scans sees beside the name.
-fn summarise(map: &TargetMap) -> String {
-    match map.gross_targets() {
-        Ok(1) => "1 probe".to_string(),
-        Ok(probes) => format!("{probes} probes"),
-        Err(_) => "a plan too large to count".to_string(),
     }
 }
 

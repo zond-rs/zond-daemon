@@ -44,10 +44,24 @@ Both speak the same protocol: one JSON object per line, in and out.
 ← {"id":2,"end":true}
 ```
 
+| | |
+|---|---|
+| `start` | a port scan, a discovery sweep or a listen, by the `kind` on the request |
+| `watch` | follow one from a cursor: what it has found, then what it finds next |
+| `get` | where it got to, as one answer |
+| `stop` | wind it down, keeping what it already found |
+| `export` | write a finished one down as JSON, JSONL, CSV, HTML or nmap XML |
+| `list` | the scans this daemon has a record of, newest first |
+| `prune` | throw away the records nobody asked to keep |
+
 `watch` takes a cursor rather than being a subscription that only runs forward
 from now, so a client that went away and came back passes the sequence number it
 reached and misses nothing. From zero it gets every host as it stands before the
 live tail begins.
+
+A scan is written down as it runs, so it outlives the process and `list`, `get`,
+`watch` and `export` all answer for one some earlier daemon ran. `--journal-dir`
+says where; `--no-journal` means scans that die with the process.
 
 The socket is created readable and writable by the user running the daemon and
 nobody else. A process that can put arbitrary packets on the wire is not one to
