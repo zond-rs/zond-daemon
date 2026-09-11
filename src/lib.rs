@@ -39,6 +39,7 @@
 //! that wants types for a host generates them from that schema, the same way it
 //! generates these messages from the proto.
 
+pub mod audit;
 pub mod codec;
 pub mod convert;
 pub mod error;
@@ -46,7 +47,9 @@ pub mod export;
 pub mod id;
 #[cfg(unix)]
 pub mod listen;
+pub mod policy;
 pub mod scans;
+pub mod scope;
 pub mod start;
 pub mod stdio;
 

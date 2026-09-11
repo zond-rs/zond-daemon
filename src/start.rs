@@ -36,6 +36,7 @@ use zond_engine::scanner::ListenScope;
 use zond_engine::system::privilege::Privilege;
 
 use crate::error::Error;
+use crate::policy::{self, Policy};
 use crate::proto;
 use crate::scans::{Scan, Started};
 
@@ -46,24 +47,24 @@ use crate::scans::{Scan, Started};
 const DEFAULT_TOP_PORTS: usize = 1000;
 
 /// Starts the scan a request describes, of whichever kind it asks for.
-pub async fn scan(wire: proto::StartRequest, root: Option<&Path>) -> Result<Started, Error> {
+pub async fn scan(wire: proto::StartRequest, under: Policy<'_>) -> Result<Started, Error> {
     let kind = proto::ScanKind::try_from(wire.kind)
         .ok()
         .and_then(crate::convert::scan_kind_of)
         .unwrap_or(ScanKind::PortScan);
 
     match kind {
-        ScanKind::Discovery => sweep(wire, root).await,
-        ScanKind::Listen => watch(wire, root).await,
+        ScanKind::Discovery => sweep(wire, under).await,
+        ScanKind::Listen => watch(wire, under).await,
         // Every other kind, which today is the port scan and tomorrow is
         // whatever the engine learns next. Asking for one this build has no
         // name for is the same as asking for nothing.
-        _ => ports(wire, root).await,
+        _ => ports(wire, under).await,
     }
 }
 
 /// Which of a host's ports are open, and what is behind them.
-async fn ports(wire: proto::StartRequest, root: Option<&Path>) -> Result<Started, Error> {
+async fn ports(wire: proto::StartRequest, under: Policy<'_>) -> Result<Started, Error> {
     let asked = request(wire)?;
     let mut config = ZondConfig::default();
     asked.apply_to(&mut config);
@@ -91,11 +92,14 @@ async fn ports(wire: proto::StartRequest, root: Option<&Path>) -> Result<Started
 
     config.exclusions = exclusions(&asked.exclude, resolver.as_ref()).await?;
 
-    let journal = root.and_then(|root| {
+    under.permit(&policy::reached_by(&map), "port_scan", &asked.targets)?;
+
+    let journal = under.root.and_then(|root| {
         let plan = Plan::port_scan(&map, &config.exclusions, config.tcp_technique);
         record(root, &plan, probes(&map))
     });
     let id = named_by(&journal);
+    under.record(&id, "port_scan", &asked.targets)?;
 
     let (session, task) = match journal {
         Some(journal) => {
@@ -113,7 +117,7 @@ async fn ports(wire: proto::StartRequest, root: Option<&Path>) -> Result<Started
 /// A sweep asks about addresses and never about ports, so a request's `ports`
 /// is not read here. Everything else it carries applies: the same exclusions,
 /// the same evasion, the same settings.
-async fn sweep(wire: proto::StartRequest, root: Option<&Path>) -> Result<Started, Error> {
+async fn sweep(wire: proto::StartRequest, under: Policy<'_>) -> Result<Started, Error> {
     let asked = request(wire)?;
     let mut config = ZondConfig::default();
     asked.apply_to(&mut config);
@@ -134,11 +138,14 @@ async fn sweep(wire: proto::StartRequest, root: Option<&Path>) -> Result<Started
 
     let addresses: IpSet = targets.into_ips();
 
-    let journal = root.and_then(|root| {
+    under.permit(&addresses, "discovery", &asked.targets)?;
+
+    let journal = under.root.and_then(|root| {
         let plan = Plan::discovery(&addresses, &config.exclusions, config.segment_sweep);
         record(root, &plan, addresses_in(&addresses))
     });
     let id = named_by(&journal);
+    under.record(&id, "discovery", &asked.targets)?;
 
     let (session, task) = match journal {
         Some(journal) => zond_engine::discover_with_journal(addresses, &config, journal).await,
@@ -153,7 +160,7 @@ async fn sweep(wire: proto::StartRequest, root: Option<&Path>) -> Result<Started
 ///
 /// The one kind that asks nothing of anybody, so it names links rather than
 /// targets and ends when it is told to rather than when the work runs out.
-async fn watch(wire: proto::StartRequest, root: Option<&Path>) -> Result<Started, Error> {
+async fn watch(wire: proto::StartRequest, under: Policy<'_>) -> Result<Started, Error> {
     let links = wire.links.clone();
     let listen_for = wire.listen_for_seconds;
 
@@ -176,11 +183,16 @@ async fn watch(wire: proto::StartRequest, root: Option<&Path>) -> Result<Started
         scope = scope.for_at_most(Duration::from_secs(u64::from(seconds)));
     }
 
-    let journal = root.and_then(|root| {
+    // No scope check: a listener puts nothing on the wire, so there is no reach
+    // for a policy to bound. What it can see is decided by which link an
+    // operator let this process open, which the operating system already
+    // answers.
+    let journal = under.root.and_then(|root| {
         let plan = Plan::listen(zones.clone());
         record(root, &plan, watching(&links))
     });
     let id = named_by(&journal);
+    under.record(&id, "listen", &links)?;
 
     let (session, task) = match journal {
         Some(journal) => zond_engine::listen_with_journal(scope, &config, journal).await,
@@ -274,7 +286,7 @@ fn watching(links: &[String]) -> String {
 /// the ports and the order are the first sitting's, and what that sitting
 /// settled is not asked again. The engine holds it to that, refusing a resume
 /// whose plan has moved.
-pub async fn resume(id: &str, root: &Path) -> Result<Started, Error> {
+pub async fn resume(id: &str, root: &Path, under: Policy<'_>) -> Result<Started, Error> {
     let entry = store::list(root)
         .map_err(Error::engine)?
         .into_iter()
@@ -299,6 +311,17 @@ pub async fn resume(id: &str, root: &Path) -> Result<Started, Error> {
                 .cloned()
                 .ok_or_else(|| holds_no(&id, "targets"))?;
 
+            // Judged again rather than trusted because it was allowed once. A
+            // policy that has narrowed since is a decision somebody made after
+            // this scan started, and continuing it would be the daemon reaching
+            // somewhere it is no longer allowed to.
+            under.permit(
+                &policy::reached_by(&map),
+                "port_scan",
+                std::slice::from_ref(&id),
+            )?;
+            under.record(&id, "port_scan", std::slice::from_ref(&id))?;
+
             let (session, task) =
                 zond_engine::scan_with_journal(map, &config, Detections::embedded(), journal)
                     .await
@@ -312,6 +335,9 @@ pub async fn resume(id: &str, root: &Path) -> Result<Started, Error> {
                 .cloned()
                 .ok_or_else(|| holds_no(&id, "addresses"))?;
 
+            under.permit(&addresses, "discovery", std::slice::from_ref(&id))?;
+            under.record(&id, "discovery", std::slice::from_ref(&id))?;
+
             let (session, task) = zond_engine::discover_with_journal(addresses, &config, journal)
                 .await
                 .map_err(Error::engine)?;
@@ -323,6 +349,8 @@ pub async fn resume(id: &str, root: &Path) -> Result<Started, Error> {
                 .links()
                 .map(<[_]>::to_vec)
                 .ok_or_else(|| holds_no(&id, "links"))?;
+
+            under.record(&id, "listen", std::slice::from_ref(&id))?;
 
             let scope = ListenScope::on(zones).recording_everything();
             let (session, task) = zond_engine::listen_with_journal(scope, &config, journal)

@@ -42,6 +42,22 @@ struct Args {
     /// only for as long as it is running.
     #[arg(long, conflicts_with = "journal_dir")]
     no_journal: bool,
+
+    /// Where scans may reach. Repeatable, in the engine's own address grammar:
+    /// `10.0.0.0/8`, `192.0.2.1-50`, a single address. Naming none permits
+    /// anywhere.
+    #[arg(long, value_name = "RANGE")]
+    allow: Vec<String>,
+
+    /// Where scans may not reach, whatever `--allow` says. Repeatable, in the
+    /// same grammar.
+    #[arg(long, value_name = "RANGE")]
+    deny: Vec<String>,
+
+    /// Write every scan started and every request refused to this file, one
+    /// JSON object per line. A scan that cannot be written down is refused.
+    #[arg(long, value_name = "PATH")]
+    audit: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -63,7 +79,32 @@ async fn main() -> ExitCode {
         );
     }
 
-    let scans = Arc::new(Scans::recording_in(root));
+    let scope = match zond_daemon::scope::Scope::read(&args.allow, &args.deny) {
+        Ok(scope) => scope,
+        Err(refused) => {
+            eprintln!("zondd: {refused}");
+            return ExitCode::from(2);
+        }
+    };
+
+    // Opened before a single scan runs, so a path nobody can write to is a
+    // mistake found now rather than at the first thing worth recording.
+    let audit = match &args.audit {
+        None => zond_daemon::audit::Audit::none(),
+        Some(path) => match zond_daemon::audit::Audit::appending_to(path) {
+            Ok(audit) => audit,
+            Err(broken) => {
+                eprintln!("zondd: {} cannot be written to: {broken}", path.display());
+                return ExitCode::from(2);
+            }
+        },
+    };
+
+    if scope.is_bounded() {
+        eprintln!("zondd: scans are bounded by the ranges named on the command line");
+    }
+
+    let scans = Arc::new(Scans::recording_in(root).within(scope).auditing(audit));
 
     // Neither, rather than a default: a daemon that opens something unasked is a
     // daemon nobody asked for, and which of the two a caller wants is not

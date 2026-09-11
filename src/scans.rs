@@ -49,9 +49,12 @@ use zond_engine::scanner::handle::ScanHandle;
 use zond_engine::scanner::session::{HostStore, Progress, ScanEvent, ScanEvents};
 use zond_engine::{ScanTask, Stage};
 
+use crate::audit::Audit;
 use crate::convert;
 use crate::error::Error;
+use crate::policy::Policy;
 use crate::proto;
+use crate::scope::Scope;
 
 /// Everything one scan has said, numbered.
 #[derive(Debug, Default)]
@@ -257,6 +260,10 @@ pub struct Scans {
     /// Where scans are written down, and `None` for a daemon that records
     /// nothing.
     root: Option<PathBuf>,
+    /// Where this daemon may be pointed.
+    scope: Scope,
+    /// Where what it was pointed at is written down.
+    audit: Audit,
 }
 
 impl Scans {
@@ -271,12 +278,38 @@ impl Scans {
         Self {
             inner: Mutex::new(HashMap::new()),
             root,
+            scope: Scope::anywhere(),
+            audit: Audit::none(),
+        }
+    }
+
+    /// Bounds where this daemon may be pointed.
+    ///
+    /// A registry told nothing may be pointed anywhere, which is what a scanner
+    /// on somebody's own machine does. See [`Scope`].
+    pub fn within(mut self, scope: Scope) -> Self {
+        self.scope = scope;
+        self
+    }
+
+    /// Writes down what it was pointed at, and what it refused.
+    pub fn auditing(mut self, audit: Audit) -> Self {
+        self.audit = audit;
+        self
+    }
+
+    /// What every scan is held to.
+    fn policy(&self) -> Policy<'_> {
+        Policy {
+            root: self.root.as_deref(),
+            scope: &self.scope,
+            audit: &self.audit,
         }
     }
 
     /// Starts a scan and files it under a name of its own.
     pub async fn start(&self, request: proto::StartRequest) -> Result<Arc<Scan>, Error> {
-        let started = crate::start::scan(request, self.root.as_deref()).await?;
+        let started = crate::start::scan(request, self.policy()).await?;
 
         Ok(self.file(started))
     }
@@ -290,7 +323,7 @@ impl Scans {
             return Err(Error::no_such_scan(id));
         };
 
-        let started = crate::start::resume(id, root).await?;
+        let started = crate::start::resume(id, root, self.policy()).await?;
 
         Ok(self.file(started))
     }
@@ -949,6 +982,138 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A policy naming ranges, for the tests that need one.
+    fn bounded(allowed: &[&str], denied: &[&str]) -> Scope {
+        Scope::read(
+            &allowed.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
+            &denied.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
+        )
+        .expect("a policy this test wrote")
+    }
+
+    /// A scan reaching outside the policy never starts.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scan_outside_the_policy_never_starts() {
+        let scans = Scans::recording_in(None).within(bounded(&["10.0.0.0/8"], &[]));
+
+        let refused = scans
+            .start(loopback())
+            .await
+            .expect_err("loopback is not in 10.0.0.0/8");
+
+        assert_eq!(refused.code(), "scope.refused");
+        assert!(refused.message().contains("127.0.0.1"), "{refused}");
+        assert!(
+            scans.list(None).expect("a listing").is_empty(),
+            "and nothing was recorded as having run"
+        );
+    }
+
+    /// The policy is applied to the addresses a request resolved to, never to
+    /// the words it named them with.
+    ///
+    /// This is the one that matters. A hostname resolves to whatever its owner
+    /// points it at, so a policy compared against the text would be one an
+    /// attacker writes the other half of: name a host inside the allowed range,
+    /// point it anywhere, and the scan follows. Both halves are here because
+    /// either alone would pass against a check that never resolved anything.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_name_is_judged_by_where_it_resolves_to() {
+        let by_name = proto::StartRequest {
+            targets: vec!["localhost".into()],
+            ports: Some("9".into()),
+            assume_up: Some(true),
+            service_detection: Some(proto::ServiceDetection::Off as i32),
+            ..Default::default()
+        };
+
+        // Allowed, because that is where the name goes.
+        let permitted = Scans::recording_in(None).within(bounded(&["127.0.0.0/8", "::1"], &[]));
+        let scan = permitted
+            .start(by_name.clone())
+            .await
+            .expect("localhost resolves inside the allowed range");
+        scan.stop();
+
+        // Refused, because that is still where the name goes, whatever it is
+        // called.
+        let refused = Scans::recording_in(None)
+            .within(bounded(&["10.0.0.0/8"], &[]))
+            .start(by_name)
+            .await
+            .expect_err("localhost does not resolve into 10.0.0.0/8");
+
+        assert_eq!(refused.code(), "scope.refused");
+    }
+
+    /// A sweep is bounded by the same policy a port scan is.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sweep_is_bounded_too() {
+        let refused = Scans::recording_in(None)
+            .within(bounded(&["10.0.0.0/8"], &[]))
+            .start(sweeping())
+            .await
+            .expect_err("a sweep of loopback under a policy that does not name it");
+
+        assert_eq!(refused.code(), "scope.refused");
+    }
+
+    /// What was asked for and what was refused are both written down.
+    ///
+    /// The refusal especially: a client repeatedly asking for what it may not
+    /// have is the thing an operator most wants to find in a log afterwards.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn what_was_asked_and_what_was_refused_are_both_recorded() {
+        let log = std::env::temp_dir().join(format!("zondd-audit-{}.jsonl", crate::id::mint()));
+
+        let scans = Scans::recording_in(None)
+            .within(bounded(&["127.0.0.0/8"], &[]))
+            .auditing(Audit::appending_to(&log).expect("a log to write to"));
+
+        let scan = scans.start(loopback()).await.expect("inside the policy");
+        scan.stop();
+
+        let outside = proto::StartRequest {
+            targets: vec!["192.0.2.1".into()],
+            ..Default::default()
+        };
+        assert!(scans.start(outside).await.is_err(), "outside it");
+
+        let written = std::fs::read_to_string(&log).expect("the log is there");
+        let lines: Vec<&str> = written.lines().collect();
+
+        assert_eq!(lines.len(), 2, "one start and one refusal: {written}");
+        assert!(lines[0].contains("\"event\":\"started\""), "{}", lines[0]);
+        assert!(
+            lines[0].contains(&scan.id),
+            "under its own name: {}",
+            lines[0]
+        );
+        assert!(lines[1].contains("\"event\":\"refused\""), "{}", lines[1]);
+        assert!(lines[1].contains("scope.refused"), "{}", lines[1]);
+        assert!(
+            lines[1].contains("192.0.2.1"),
+            "naming what was asked for: {}",
+            lines[1]
+        );
+
+        std::fs::remove_file(&log).ok();
+    }
+
+    /// A log that cannot be opened stops the daemon rather than being skipped.
+    ///
+    /// An audit nobody can write is not an audit, and finding that out at the
+    /// first thing worth recording is finding it out too late.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_log_that_cannot_be_opened_is_a_mistake_found_at_once() {
+        let directory = std::env::temp_dir();
+
+        assert!(
+            Audit::appending_to(&directory).is_err(),
+            "a directory is not somewhere to append lines"
+        );
     }
 
     /// A whole scan, followed from a cursor to the end.
