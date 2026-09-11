@@ -111,10 +111,14 @@ subnet. And it needs raw sockets, which nothing else does: whatever a person
 talks to holds no capabilities at all and reaches the daemon through a socket in
 a shared volume, which is where the policy is enforced.
 
-## An example
+## Examples
 
-[`examples/scan.ts`](examples/scan.ts) is a client in about a hundred lines: no
-port, no TLS, no generated code and no build step.
+Three clients, in three languages, none of them needing a library. There is
+nothing for one to do: the protocol is one JSON object per line.
+
+**[`examples/scan.ts`](examples/scan.ts)** — TypeScript, no build step. Starts a
+daemon, port-scans a host with detections, and prints what it finds as it finds
+it.
 
 ```bash
 cargo build
@@ -129,8 +133,40 @@ ZONDD=./target/debug/zondd node examples/scan.ts 127.0.0.1
          ! CouchDB served its database list without authentication
 ```
 
-Nothing in it is particular to TypeScript beyond the types. Any language that
-can start a program and read lines from it does this in about as much code.
+**[`examples/scan.py`](examples/scan.py)** — Python, standard library only. The
+other half: a discovery sweep, followed to the end, then exported. It reaches the
+daemon either way, as a program it starts or as a socket somebody else is serving.
+
+```bash
+ZONDD=./target/debug/zondd python3 examples/scan.py 127.0.0.1
+ZOND_SOCKET=/run/zond/zond.sock python3 examples/scan.py 10.0.0.0/24
+```
+
+```text
+sweeping 127.0.0.1 as 06G93A052D9P33GN
+
+127.0.0.1                               localhost
+
+1 host, written to 06G93A052D9P33GN.json
+```
+
+**[`examples/detections.sh`](examples/detections.sh)** — a line of JSON and `jq`.
+What a scan would check for, grouped by what running it does to the target, which
+is the thing `--detection` sets a ceiling on.
+
+```bash
+ZONDD=./target/debug/zondd sh examples/detections.sh DETECTION_CLASS_ACTIVE_BENIGN
+```
+
+```text
+DERIVED  (18)
+    ad-dns-server  Active Directory server (Kerberos + DNS)
+    …
+```
+
+Nothing in any of them is particular to its language beyond the types. Anything
+that can start a program, or open a socket, and read lines from it does this in
+about as much code.
 
 ## Status
 
