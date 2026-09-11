@@ -31,6 +31,7 @@
 //! finished last week be read through the same call as one still running.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,6 +39,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
 
 use zond_engine::export::{ExportOptions, Redaction, schema::HostDto};
+use zond_engine::journal::store;
 use zond_engine::model::ip::scoped::ScopedIp;
 use zond_engine::scanner::handle::ScanHandle;
 use zond_engine::scanner::session::{HostStore, Progress, ScanEvent, ScanEvents};
@@ -188,7 +190,8 @@ impl Scan {
         let seq = self.log.watermark();
         let options = ExportOptions::new().with_redaction(self.redaction);
 
-        self.hosts
+        let mut caught_up: Vec<proto::Event> = self
+            .hosts
             .snapshot()
             .iter()
             .filter_map(|host| {
@@ -202,7 +205,16 @@ impl Scan {
                     })),
                 })
             })
-            .collect()
+            .collect();
+
+        // Where the scan stands, which a client starting here would otherwise
+        // not learn until the next time it changed.
+        caught_up.push(proto::Event {
+            seq,
+            body: Some(proto::event::Body::Progress(self.progress())),
+        });
+
+        caught_up
     }
 
     /// Everything after `cursor`, waiting for more if the scan is still running.
@@ -232,12 +244,29 @@ impl Scan {
 #[derive(Debug, Default)]
 pub struct Scans {
     inner: Mutex<HashMap<String, Arc<Scan>>>,
+    /// Where scans are written down, and `None` for a daemon that records
+    /// nothing.
+    root: Option<PathBuf>,
 }
 
 impl Scans {
+    /// A registry that records its scans under `root`.
+    ///
+    /// `None` records nothing, which is a daemon whose scans die with it. That
+    /// is a choice a caller makes rather than one this crate makes for them: a
+    /// process with no writable place to record is still a process that can
+    /// scan, and a test has no business writing into the operator's own journal
+    /// directory.
+    pub fn recording_in(root: Option<PathBuf>) -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            root,
+        }
+    }
+
     /// Starts a scan and files it under a name of its own.
     pub async fn start(&self, request: proto::StartRequest) -> Result<Arc<Scan>, Error> {
-        let started = crate::start::scan(request).await?;
+        let started = crate::start::scan(request, self.root.as_deref()).await?;
         let scan = Arc::new(started.scan);
 
         self.inner
@@ -250,14 +279,140 @@ impl Scans {
         Ok(scan)
     }
 
-    /// The scan filed under `id`.
-    pub fn get(&self, id: &str) -> Result<Arc<Scan>, Error> {
-        self.inner
+    /// The scan named `id`, whether or not this process is the one running it.
+    ///
+    /// A scan still going is held here. One that is not is read back out of the
+    /// journal the engine wrote while it ran, which is how a scan outlives the
+    /// process that started it and how the same call answers for one that
+    /// finished last week.
+    pub fn get(&self, id: &str) -> Result<Found, Error> {
+        let running = self
+            .inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(id)
-            .cloned()
-            .ok_or_else(|| Error::no_such_scan(id))
+            .cloned();
+
+        match running {
+            Some(scan) => Ok(Found::Live(scan)),
+            None => match self.root.as_deref() {
+                Some(root) => Recorded::read(root, id).map(Found::Recorded),
+                None => Err(Error::no_such_scan(id)),
+            },
+        }
+    }
+}
+
+/// A scan this process is running, or one it only has the record of.
+#[derive(Debug, Clone)]
+pub enum Found {
+    /// Still going, or finished since this process started.
+    Live(Arc<Scan>),
+    /// Written down by some earlier run, and read back off disk.
+    Recorded(Arc<Recorded>),
+}
+
+impl Found {
+    /// Where the scan got to.
+    pub fn state(&self) -> proto::ScanState {
+        match self {
+            Found::Live(scan) => scan.state(),
+            Found::Recorded(recorded) => recorded.state(),
+        }
+    }
+
+    /// Every host as it stands, and where the scan is.
+    pub fn snapshot(&self) -> Vec<proto::Event> {
+        match self {
+            Found::Live(scan) => scan.snapshot(),
+            Found::Recorded(recorded) => recorded.snapshot(),
+        }
+    }
+
+    /// Whatever happened after `cursor`, waiting if there is more to come.
+    pub async fn after(&self, cursor: u64) -> Vec<proto::Event> {
+        match self {
+            Found::Live(scan) => scan.after(cursor).await,
+            // Nothing further will ever happen to a scan that is over.
+            Found::Recorded(_) => Vec::new(),
+        }
+    }
+
+    /// Winds the scan down, where there is anything left to wind down.
+    pub fn stop(&self) {
+        if let Found::Live(scan) = self {
+            scan.stop();
+        }
+    }
+}
+
+/// A scan read back out of its journal.
+///
+/// Everything it found, and nothing about how it got there: the journal keeps
+/// the findings rather than the order they arrived in, so this answers a watch
+/// with one frame per host and then the end.
+#[derive(Debug)]
+pub struct Recorded {
+    id: String,
+    hosts: Vec<proto::Event>,
+}
+
+impl Recorded {
+    /// Reads the scan named `id` off disk.
+    fn read(root: &Path, id: &str) -> Result<Arc<Self>, Error> {
+        let entries = store::list(root).map_err(Error::engine)?;
+
+        let entry = entries
+            .into_iter()
+            .find(|entry| entry.manifest.id == id)
+            .ok_or_else(|| Error::no_such_scan(id))?;
+
+        let report = store::report(&entry.directory).map_err(Error::engine)?;
+        let options = ExportOptions::new();
+
+        let hosts = report
+            .hosts()
+            .enumerate()
+            .filter_map(|(index, host)| {
+                let document = serde_json::to_string(&HostDto::new(host, &options)).ok()?;
+
+                Some(proto::Event {
+                    seq: index as u64 + 1,
+                    body: Some(proto::event::Body::Host(proto::HostChanged {
+                        address: host.scoped_ip().to_string(),
+                        document,
+                    })),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        Ok(Arc::new(Self {
+            id: entry.manifest.id,
+            hosts,
+        }))
+    }
+
+    fn state(&self) -> proto::ScanState {
+        proto::ScanState {
+            scan_id: self.id.clone(),
+            running: false,
+            // The record keeps what the scan found rather than why it stopped,
+            // so this build says nothing rather than guessing at `completed`.
+            cause: None,
+            progress: Some(proto::Progress {
+                stage: proto::Stage::Finishing as i32,
+                stage_done: None,
+                stage_total: None,
+                overall_done: None,
+                overall_total: None,
+            }),
+            seq: self.hosts.len() as u64,
+            report: None,
+        }
+    }
+
+    fn snapshot(&self) -> Vec<proto::Event> {
+        self.hosts.clone()
     }
 }
 
@@ -473,16 +628,84 @@ mod tests {
                 event.seq, mark,
                 "a snapshot describes the scan as of one moment"
             );
-            assert!(
-                matches!(event.body, Some(proto::event::Body::Host(_))),
-                "a snapshot is hosts and nothing else"
-            );
         }
+
+        assert!(
+            matches!(
+                snapshot.last().and_then(|last| last.body.as_ref()),
+                Some(proto::event::Body::Progress(_))
+            ),
+            "a snapshot ends by saying where the scan is, so a client starting \
+             here does not have to ask: {snapshot:?}"
+        );
 
         assert!(
             scan.after(mark).await.is_empty(),
             "and there is nothing after it to catch up on"
         );
+    }
+
+    /// A scan outlives the process that ran it.
+    ///
+    /// The registry that reads it back knows nothing about it: a different
+    /// instance over the same directory, which is what a daemon restarting is.
+    /// What comes back is what the engine wrote down while the scan ran, so this
+    /// covers the whole round trip rather than a cache.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scan_is_read_back_after_the_process_that_ran_it_is_gone() {
+        let root = std::env::temp_dir().join(format!("zondd-journal-{}", crate::id::mint()));
+        let scans = Scans::recording_in(Some(root.clone()));
+
+        let scan = scans.start(loopback()).await.expect("a recorded scan");
+        let id = scan.id.clone();
+
+        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            let mut cursor = 0;
+            loop {
+                let events = scan.after(cursor).await;
+                if events.is_empty() {
+                    return;
+                }
+                cursor = events.last().map(|last| last.seq).unwrap_or(cursor);
+            }
+        })
+        .await
+        .expect("a scan of three loopback ports finishes");
+
+        // Nothing of this scan in memory. Only what is on disk.
+        let afterwards = Scans::recording_in(Some(root.clone()));
+        let found = afterwards
+            .get(&id)
+            .unwrap_or_else(|refused| panic!("reading {id} back: {refused}"));
+
+        let state = found.state();
+        assert_eq!(state.scan_id, id);
+        assert!(!state.running, "a scan read off disk is not running");
+        assert!(
+            !found.snapshot().is_empty(),
+            "the hosts it found came back with it"
+        );
+        assert!(
+            found.after(0).await.is_empty(),
+            "and nothing further will ever happen to it"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A daemon told to record nothing says a scan it has forgotten is unknown,
+    /// rather than going looking through somebody else's journals for it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_daemon_that_records_nothing_has_nothing_to_read_back() {
+        let scans = Scans::recording_in(None);
+        let scan = scans.start(loopback()).await.expect("a scan all the same");
+
+        assert!(
+            Scans::recording_in(None).get(&scan.id).is_err(),
+            "nothing was written down, so nothing is there"
+        );
+
+        scan.stop();
     }
 
     /// Two scans are two scans, each under its own name.
@@ -493,7 +716,10 @@ mod tests {
         let second = scans.start(loopback()).await.expect("and another");
 
         assert_ne!(first.id, second.id);
-        assert_eq!(scans.get(&first.id).expect("filed").id, first.id);
+        assert_eq!(
+            scans.get(&first.id).expect("filed").state().scan_id,
+            first.id
+        );
         assert!(scans.get("0000000000000").is_err(), "and no others");
 
         first.stop();

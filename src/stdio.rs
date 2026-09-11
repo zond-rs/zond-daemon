@@ -46,7 +46,7 @@ use tokio::sync::Mutex;
 
 use crate::error::Error;
 use crate::proto;
-use crate::scans::Scans;
+use crate::scans::{Found, Scans};
 
 /// Wherever frames go, which every task writing one has to take a turn at.
 type Out<W> = Arc<Mutex<W>>;
@@ -156,7 +156,7 @@ async fn start(scans: &Scans, params: Value) -> Result<proto::StartResponse, Err
 }
 
 /// The scan a request named.
-fn named(scans: &Scans, params: Value) -> Result<Arc<crate::scans::Scan>, Error> {
+fn named(scans: &Scans, params: Value) -> Result<Found, Error> {
     let asked: proto::GetRequest = serde_json::from_value(params).map_err(Error::malformed)?;
 
     scans.get(&asked.scan_id)
@@ -186,7 +186,16 @@ async fn watch<W: AsyncWrite + Unpin>(
     let mut cursor = asked.from_seq;
 
     if cursor == 0 {
-        for event in scan.snapshot() {
+        let caught_up = scan.snapshot();
+
+        // Forward to where the snapshot describes the scan as of, or the tail
+        // below starts at the beginning of the log and says everything the
+        // snapshot just said a second time.
+        if let Some(last) = caught_up.last() {
+            cursor = last.seq;
+        }
+
+        for event in caught_up {
             frame(out, json!({"id": id, "event": event})).await?;
         }
     }
@@ -291,6 +300,128 @@ mod tests {
         }
 
         exchange_raw(&bytes).await
+    }
+
+    /// A client that keeps its connection open, so it can ask, read the answer,
+    /// and ask again.
+    ///
+    /// What `exchange` cannot do: every request there is written before any
+    /// answer is read, so nothing can name a scan the first request only just
+    /// created.
+    struct Client {
+        writing: tokio::io::DuplexStream,
+        lines: tokio::io::Lines<BufReader<tokio::io::DuplexStream>>,
+    }
+
+    impl Client {
+        fn connect(scans: Arc<Scans>) -> Self {
+            let (writing, server_reads) = tokio::io::duplex(1 << 20);
+            let (server_writes, from_server) = tokio::io::duplex(1 << 20);
+
+            tokio::spawn(speak(scans, BufReader::new(server_reads), server_writes));
+
+            Self {
+                writing,
+                lines: BufReader::new(from_server).lines(),
+            }
+        }
+
+        async fn send(&mut self, request: Value) {
+            let mut bytes = serde_json::to_vec(&request).expect("a request is writable");
+            bytes.push(b'\n');
+
+            self.writing
+                .write_all(&bytes)
+                .await
+                .expect("the pipe takes it");
+        }
+
+        async fn next(&mut self) -> Value {
+            let line = self
+                .lines
+                .next_line()
+                .await
+                .expect("frames are readable")
+                .expect("the daemon said something");
+
+            serde_json::from_str(&line).expect("and it is a frame")
+        }
+    }
+
+    /// Watching from the beginning says each host once, not twice.
+    ///
+    /// A watch from nothing answers with a snapshot and then the live tail, and
+    /// the tail has to begin where the snapshot left off. Starting it at the top
+    /// of the log instead says everything the snapshot just said a second time,
+    /// which a client reading events as news would count as findings arriving
+    /// twice.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_watch_from_the_beginning_does_not_say_everything_twice() {
+        let mut client = Client::connect(Arc::new(Scans::recording_in(None)));
+
+        client
+            .send(json!({
+                "id": 1,
+                "method": "start",
+                "params": {
+                    "targets": ["127.0.0.1"],
+                    "ports": "9,22",
+                    "assume_up": true,
+                    "service_detection": "SERVICE_DETECTION_OFF"
+                }
+            }))
+            .await;
+
+        let started = client.next().await;
+        let id = started["result"]["scan_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a scan was named: {started}"))
+            .to_string();
+
+        // Watched only once there is a history to have missed. A watch opened
+        // before the scan has said anything has an empty snapshot, and an empty
+        // snapshot cannot be repeated.
+        loop {
+            client
+                .send(json!({"id": 9, "method": "get", "params": {"scan_id": id}}))
+                .await;
+
+            if client.next().await["result"]["running"] == json!(false) {
+                break;
+            }
+        }
+
+        client
+            .send(json!({"id": 2, "method": "watch", "params": {"scan_id": id, "from_seq": 0}}))
+            .await;
+
+        // Never backwards. The snapshot is stamped with the mark it describes
+        // the scan as of, and with the cursor left at nothing the tail would
+        // start at the top of the log and step back behind it.
+        let mut seen = Vec::new();
+        let mut furthest = 0;
+
+        loop {
+            let frame = client.next().await;
+            if frame["end"] == json!(true) {
+                break;
+            }
+
+            let seq = frame["event"]["seq"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("every event is numbered: {frame}"));
+
+            assert!(
+                seq >= furthest,
+                "the tail went back to {seq} having already said {furthest}, so \
+                 everything between them is said twice: {seen:?}"
+            );
+
+            furthest = seq;
+            seen.push(seq);
+        }
+
+        assert!(!seen.is_empty(), "a scan that said nothing at all");
     }
 
     /// A method nobody wrote is refused by name, under the id that asked.

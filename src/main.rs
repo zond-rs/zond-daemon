@@ -32,13 +32,38 @@ struct Args {
     /// user running the daemon and by nobody else.
     #[arg(long, value_name = "PATH")]
     listen: Option<PathBuf>,
+
+    /// Write scans down under this directory, so they outlive the process and
+    /// can be read back by name. Defaults to this user's own journal directory.
+    #[arg(long, value_name = "PATH")]
+    journal_dir: Option<PathBuf>,
+
+    /// Keep no record of the scans this daemon runs. They are then readable
+    /// only for as long as it is running.
+    #[arg(long, conflicts_with = "journal_dir")]
+    no_journal: bool,
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = Args::parse();
 
-    let scans = Arc::new(Scans::default());
+    let root = if args.no_journal {
+        None
+    } else {
+        args.journal_dir
+            .clone()
+            .or_else(zond_engine::journal::paths::root)
+    };
+
+    if root.is_none() && !args.no_journal {
+        eprintln!(
+            "zondd: nowhere to write scans down, so none will outlive this process.\n\
+             Name a directory with --journal-dir, or say --no-journal to mean it."
+        );
+    }
+
+    let scans = Arc::new(Scans::recording_in(root));
 
     // Neither, rather than a default: a daemon that opens something unasked is a
     // daemon nobody asked for, and which of the two a caller wants is not
