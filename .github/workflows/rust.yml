@@ -2,7 +2,9 @@ name: rust
 
 on:
   push:
-    branches: [main]
+    # The working branch as well as main, so what breaks is found on the branch
+    # that broke it rather than after it has been merged.
+    branches: [main, feat/main]
   pull_request:
 
 permissions:
@@ -26,6 +28,11 @@ jobs:
         with:
           repository: zond-rs/zond-engine
           path: zond-engine
+
+      # The engine links against libpcap, which a runner does not have. The
+      # engine's own workflows install it the same way.
+      - name: Install libpcap
+        run: sudo apt-get update || true; sudo apt-get install -y libpcap-dev
 
       - uses: dtolnay/rust-toolchain@stable
         with:

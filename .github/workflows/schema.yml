@@ -2,7 +2,9 @@ name: schema
 
 on:
   push:
-    branches: [main]
+    # The working branch as well as main, so what breaks is found on the branch
+    # that broke it rather than after it has been merged.
+    branches: [main, feat/main]
   pull_request:
 
 permissions:
