@@ -64,6 +64,12 @@ const ENUM_FIELDS: &[(&str, &str)] = &[
         "detection_class::optional",
     ),
     ("zond.v1.Settings.effort", "scan_effort::optional"),
+    ("zond.v1.Settings.tcp_technique", "tcp_technique::optional"),
+    (
+        "zond.v1.Settings.sctp_technique",
+        "sctp_technique::optional",
+    ),
+    ("zond.v1.Settings.send_mode", "send_mode::optional"),
     ("zond.v1.StageChanged.stage", "stage"),
     ("zond.v1.Progress.stage", "stage"),
     ("zond.v1.Finished.cause", "stop_cause"),

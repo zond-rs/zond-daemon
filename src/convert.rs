@@ -21,7 +21,9 @@
 use zond_engine::Stage;
 use zond_engine::config::{OsDetection, ScanEffort, ServiceDetection};
 use zond_engine::model::finding::DetectionClass;
+use zond_engine::model::technique::{SctpScanTechnique, TcpScanTechnique};
 use zond_engine::scanner::handle::StopCause;
+use zond_engine::transport::probe::SendMode;
 
 use crate::proto;
 
@@ -151,6 +153,72 @@ pub fn scan_effort_of(named: proto::ScanEffort) -> Option<ScanEffort> {
         proto::ScanEffort::Fast => Some(ScanEffort::Fast),
         proto::ScanEffort::Balanced => Some(ScanEffort::Balanced),
         proto::ScanEffort::Thorough => Some(ScanEffort::Thorough),
+    }
+}
+
+/// The schema's name for which TCP probe a scan sends.
+pub fn tcp_technique(technique: TcpScanTechnique) -> proto::TcpScanTechnique {
+    match technique {
+        TcpScanTechnique::Syn => proto::TcpScanTechnique::Syn,
+        TcpScanTechnique::Ack => proto::TcpScanTechnique::Ack,
+        TcpScanTechnique::Fin => proto::TcpScanTechnique::Fin,
+        TcpScanTechnique::Null => proto::TcpScanTechnique::Null,
+        TcpScanTechnique::Xmas => proto::TcpScanTechnique::Xmas,
+        TcpScanTechnique::Maimon => proto::TcpScanTechnique::Maimon,
+        TcpScanTechnique::Window => proto::TcpScanTechnique::Window,
+        _ => proto::TcpScanTechnique::Unspecified,
+    }
+}
+
+/// What the engine reads the schema's name as.
+pub fn tcp_technique_of(named: proto::TcpScanTechnique) -> Option<TcpScanTechnique> {
+    match named {
+        proto::TcpScanTechnique::Unspecified => None,
+        proto::TcpScanTechnique::Syn => Some(TcpScanTechnique::Syn),
+        proto::TcpScanTechnique::Ack => Some(TcpScanTechnique::Ack),
+        proto::TcpScanTechnique::Fin => Some(TcpScanTechnique::Fin),
+        proto::TcpScanTechnique::Null => Some(TcpScanTechnique::Null),
+        proto::TcpScanTechnique::Xmas => Some(TcpScanTechnique::Xmas),
+        proto::TcpScanTechnique::Maimon => Some(TcpScanTechnique::Maimon),
+        proto::TcpScanTechnique::Window => Some(TcpScanTechnique::Window),
+    }
+}
+
+/// The schema's name for which SCTP probe a scan sends.
+pub fn sctp_technique(technique: SctpScanTechnique) -> proto::SctpScanTechnique {
+    match technique {
+        SctpScanTechnique::Init => proto::SctpScanTechnique::Init,
+        SctpScanTechnique::CookieEcho => proto::SctpScanTechnique::CookieEcho,
+        _ => proto::SctpScanTechnique::Unspecified,
+    }
+}
+
+/// What the engine reads the schema's name as.
+pub fn sctp_technique_of(named: proto::SctpScanTechnique) -> Option<SctpScanTechnique> {
+    match named {
+        proto::SctpScanTechnique::Unspecified => None,
+        proto::SctpScanTechnique::Init => Some(SctpScanTechnique::Init),
+        proto::SctpScanTechnique::CookieEcho => Some(SctpScanTechnique::CookieEcho),
+    }
+}
+
+/// The schema's name for how a probe reaches the wire.
+pub fn send_mode(mode: SendMode) -> proto::SendMode {
+    match mode {
+        SendMode::Auto => proto::SendMode::Auto,
+        SendMode::Ethernet => proto::SendMode::Ethernet,
+        SendMode::RawSocket => proto::SendMode::RawSocket,
+        _ => proto::SendMode::Unspecified,
+    }
+}
+
+/// What the engine reads the schema's name as.
+pub fn send_mode_of(named: proto::SendMode) -> Option<SendMode> {
+    match named {
+        proto::SendMode::Unspecified => None,
+        proto::SendMode::Auto => Some(SendMode::Auto),
+        proto::SendMode::Ethernet => Some(SendMode::Ethernet),
+        proto::SendMode::RawSocket => Some(SendMode::RawSocket),
     }
 }
 
@@ -286,6 +354,44 @@ mod tests {
                 Some(effort),
                 "{effort:?} came back as something else"
             );
+        }
+    }
+
+    #[test]
+    fn every_tcp_technique_survives_the_round_trip() {
+        for technique in TcpScanTechnique::ALL {
+            let named = tcp_technique(technique);
+
+            assert_ne!(
+                named,
+                proto::TcpScanTechnique::Unspecified,
+                "the engine sends {technique:?} and the schema has no name for it"
+            );
+            assert_eq!(tcp_technique_of(named), Some(technique));
+        }
+    }
+
+    #[test]
+    fn every_sctp_technique_survives_the_round_trip() {
+        for technique in SctpScanTechnique::ALL {
+            let named = sctp_technique(technique);
+
+            assert_ne!(
+                named,
+                proto::SctpScanTechnique::Unspecified,
+                "{technique:?}"
+            );
+            assert_eq!(sctp_technique_of(named), Some(technique));
+        }
+    }
+
+    #[test]
+    fn every_send_mode_survives_the_round_trip() {
+        for mode in SendMode::ALL {
+            let named = send_mode(mode);
+
+            assert_ne!(named, proto::SendMode::Unspecified, "{mode:?}");
+            assert_eq!(send_mode_of(named), Some(mode));
         }
     }
 

@@ -141,11 +141,28 @@ enum DetectionClass {
 
 // What a probe looks like on the wire, for a scan that would rather not look
 // like every other scan.
+//
+// Refused rather than ignored where a value will not fit: a TTL of 300 or a
+// hardware address that is not one is a mistake worth naming, and a scan that
+// quietly dropped it would send probes nobody asked for.
 message Evasion {
+  // 1 to 65535.
   optional uint32 source_port = 1;
+  // 1 to 255.
   optional uint32 ttl = 2;
+  // The size to fragment probes to, in bytes.
   optional uint32 fragment_mtu = 3;
+  // Bytes of padding to add to each probe.
   optional uint32 padding = 4;
+  // Addresses to make the probes appear to come from as well as this host.
+  repeated string decoys = 5;
+  // The TCP flag bits to set, as a number. 0 to 255.
+  optional uint32 flags = 6;
+  // The hardware address to send from, `00:00:5e:00:53:01`.
+  optional string spoof_mac = 7;
+  // Sends probes with a checksum that is wrong on purpose, which some
+  // middleboxes answer and most hosts drop.
+  optional bool bad_tcp_checksum = 8;
 }
 
 // The knobs worth setting once, rather than per run.
@@ -155,12 +172,62 @@ message Settings {
   optional uint32 host_timeout = 2;
   // Seconds the whole scan gets before it winds itself down.
   optional uint32 scan_timeout = 3;
+  // Probes per second, at most and at least. Neither may be zero.
   optional uint32 max_probe_rate = 4;
   optional uint32 min_probe_rate = 5;
+  // How many times one target is asked before the scan gives up on it. 1 to 255.
   optional uint32 max_attempts = 6;
+  // Generates no DNS traffic at all, for a run that must not be seen asking.
   optional bool no_dns = 7;
+  // Masks hostnames and hardware addresses in what comes back.
   optional bool redact = 8;
   optional bool tls_enumeration = 9;
+  // The shortest gap between two probes aimed at one host, in milliseconds.
+  // Milliseconds rather than seconds because a second between probes is a scan
+  // nobody would wait for.
+  optional uint32 host_probe_interval_ms = 10;
+  // Backs off from a host that answers nothing, rather than spending the whole
+  // retry budget on it.
+  optional bool dampen_silent_hosts = 11;
+  // The ports a request that names none is taken to mean.
+  optional string default_ports = 12;
+  optional TcpScanTechnique tcp_technique = 13;
+  optional SctpScanTechnique sctp_technique = 14;
+  optional SendMode send_mode = 15;
+  // Multiplies every timeout the scan works out for itself, for a network
+  // slower or faster than the one the defaults assume. Greater than zero.
+  optional double timeout_scale = 16;
+}
+
+// Which TCP probe a scan sends, each answered differently by a different sort of
+// host and firewall.
+enum TcpScanTechnique {
+  TCP_SCAN_TECHNIQUE_UNSPECIFIED = 0;
+  // A half-open handshake. What a scan does unless told otherwise.
+  TCP_SCAN_TECHNIQUE_SYN = 1;
+  TCP_SCAN_TECHNIQUE_ACK = 2;
+  TCP_SCAN_TECHNIQUE_FIN = 3;
+  TCP_SCAN_TECHNIQUE_NULL = 4;
+  TCP_SCAN_TECHNIQUE_XMAS = 5;
+  TCP_SCAN_TECHNIQUE_MAIMON = 6;
+  TCP_SCAN_TECHNIQUE_WINDOW = 7;
+}
+
+enum SctpScanTechnique {
+  SCTP_SCAN_TECHNIQUE_UNSPECIFIED = 0;
+  SCTP_SCAN_TECHNIQUE_INIT = 1;
+  SCTP_SCAN_TECHNIQUE_COOKIE_ECHO = 2;
+}
+
+// How a probe reaches the wire.
+enum SendMode {
+  SEND_MODE_UNSPECIFIED = 0;
+  // Whichever of the two works here. What a scan does unless told otherwise.
+  SEND_MODE_AUTO = 1;
+  // Built as a whole frame and put on the link.
+  SEND_MODE_ETHERNET = 2;
+  // Handed to a raw socket, letting the kernel address it.
+  SEND_MODE_RAW_SOCKET = 3;
 }
 
 // How much the engine spends on being sure, against how long it takes.

@@ -115,6 +115,13 @@ named!(
 named!(os_detection, proto::OsDetection, "OS detection level");
 named!(detection_class, proto::DetectionClass, "detection class");
 named!(scan_effort, proto::ScanEffort, "scan effort");
+named!(tcp_technique, proto::TcpScanTechnique, "TCP scan technique");
+named!(
+    sctp_technique,
+    proto::SctpScanTechnique,
+    "SCTP scan technique"
+);
+named!(send_mode, proto::SendMode, "send mode");
 
 // ╔════════════════════════════════════════════╗
 // ║ ████████╗███████╗███████╗████████╗███████╗ ║
