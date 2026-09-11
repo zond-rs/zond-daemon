@@ -16,8 +16,59 @@
 //! Only the messages are generated here. The service is declared in the schema
 //! and nothing generates stubs for it yet, because the first transport frames
 //! the same messages over a pipe and has no use for them.
+//!
+//! The generated types carry serde derives, since the first transport writes
+//! them as JSON. Every field whose type is an enum is pointed at the matching
+//! module in `src/codec.rs`, so it travels as the name the schema gives it
+//! rather than as the number protobuf stores. A field added to the schema in an
+//! enum's type needs a line here; nothing else about it needs writing twice.
 
 use std::path::PathBuf;
+
+/// Every field whose type is an enum, and the codec module that writes it by
+/// name. `optional` in the path is the variant for a field the schema marked
+/// `optional`, which the generated code carries as an `Option<i32>`.
+/// Every message whose fields may be left out of a request or a frame.
+///
+/// `Event` is not among them. It is written by this process rather than read
+/// from a client, so no field of it is ever absent, and a path naming it reaches
+/// the variants of its oneof, which serde will not take a `default` on.
+const DEFAULTED: &[&str] = &[
+    "zond.v1.StartRequest",
+    "zond.v1.StartResponse",
+    "zond.v1.Evasion",
+    "zond.v1.Settings",
+    "zond.v1.WatchRequest",
+    "zond.v1.HostChanged",
+    "zond.v1.StageChanged",
+    "zond.v1.Progress",
+    "zond.v1.ScannerFailed",
+    "zond.v1.Finished",
+    "zond.v1.GetRequest",
+    "zond.v1.StopRequest",
+    "zond.v1.ScanState",
+    "zond.v1.Error",
+];
+
+const ENUM_FIELDS: &[(&str, &str)] = &[
+    (
+        "zond.v1.StartRequest.service_detection",
+        "service_detection::optional",
+    ),
+    (
+        "zond.v1.StartRequest.os_detection",
+        "os_detection::optional",
+    ),
+    (
+        "zond.v1.StartRequest.detection",
+        "detection_class::optional",
+    ),
+    ("zond.v1.Settings.effort", "scan_effort::optional"),
+    ("zond.v1.StageChanged.stage", "stage"),
+    ("zond.v1.Progress.stage", "stage"),
+    ("zond.v1.Finished.cause", "stop_cause"),
+    ("zond.v1.ScanState.cause", "stop_cause::optional"),
+];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The whole directory, so adding a file to the schema rebuilds without
@@ -27,9 +78,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let descriptors = protox::compile(["zond/v1/scan.proto"], ["proto"])?;
 
     let out = PathBuf::from(std::env::var("OUT_DIR")?);
-    prost_build::Config::new()
+    let mut config = prost_build::Config::new();
+
+    config
         .out_dir(&out)
-        .compile_fds(descriptors)?;
+        .type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]");
+
+    // A field a client left out is a field it had nothing to say about, not a
+    // malformed request, so the schema's own defaults stand. Set on the message
+    // rather than on each of its fields: one attribute covers every field, where
+    // a field path has to name each one and would be a second list to keep.
+    //
+    // Named per message rather than globally, because a blanket rule reaches the
+    // variants inside `Event`'s oneof and serde has no `default` for a variant.
+    for message in DEFAULTED {
+        config.type_attribute(message, "#[serde(default)]");
+    }
+
+    for (field, module) in ENUM_FIELDS {
+        config.field_attribute(
+            field,
+            format!("#[serde(with = \"crate::codec::{module}\")]"),
+        );
+    }
+
+    config.compile_fds(descriptors)?;
 
     Ok(())
 }

@@ -39,6 +39,7 @@
 //! that wants types for a host generates them from that schema, the same way it
 //! generates these messages from the proto.
 
+pub mod codec;
 pub mod convert;
 
 /// The protocol, compiled from `proto/zond/v1/scan.proto`.
