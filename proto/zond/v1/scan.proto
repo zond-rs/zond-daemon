@@ -40,6 +40,12 @@ service Scans {
   // Stopping is not cancelling. The scan keeps what it has already found and
   // still writes its report, and the report says it was stopped.
   rpc Stop(StopRequest) returns (ScanState);
+
+  // What a scan found, written out in one of the formats the engine knows.
+  //
+  // For a scan that is over. A scan still running has no report to write, and
+  // `Watch` is how its findings arrive in the meantime.
+  rpc Export(ExportRequest) returns (ExportResponse);
 }
 
 // ── Starting ────────────────────────────────────────────────────────────────
@@ -389,9 +395,47 @@ message ScanState {
   // that wants only what happens next starts watching from.
   uint64 seq = 5;
 
-  // The finished report, shaped as `zond-report-v1` shapes one, and absent while
-  // the scan is still running. See `HostChanged` for why it is a document.
-  optional string report = 6;
+  // Always absent. `Export` writes a report, in any of five formats and without
+  // putting the whole of one into every answer about how a scan is going.
+  optional string report = 6 [deprecated = true];
+}
+
+// ── Writing it down ─────────────────────────────────────────────────────────
+
+message ExportRequest {
+  string scan_id = 1;
+  ExportFormat format = 2;
+
+  // Masks hostnames and hardware addresses in what comes back. Set on the scan
+  // itself where every reader should see it masked; set here where one reader
+  // should and others should not.
+  optional bool redact = 3;
+}
+
+message ExportResponse {
+  // The whole document, as text. Every format this engine writes is text.
+  string document = 1;
+
+  // What it was written as, echoed so a caller holding several does not have to
+  // remember which is which.
+  ExportFormat format = 2;
+}
+
+// The shapes a scan can be written down in.
+enum ExportFormat {
+  EXPORT_FORMAT_UNSPECIFIED = 0;
+  // This engine's own, and the only one that carries everything it found. Held
+  // to `zond-report-v1` by a test on every build.
+  EXPORT_FORMAT_JSON = 1;
+  // The same, one record per line, so a reader can take it a host at a time and
+  // a file cut short is still readable.
+  EXPORT_FORMAT_JSONL = 2;
+  // A flat table, one row per host and port, for a spreadsheet.
+  EXPORT_FORMAT_CSV = 3;
+  // One page, for reading rather than parsing.
+  EXPORT_FORMAT_HTML = 4;
+  // Nmap's XML, for the pipelines that already read it.
+  EXPORT_FORMAT_NMAP_XML = 5;
 }
 
 // ── Failing ─────────────────────────────────────────────────────────────────

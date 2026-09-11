@@ -41,6 +41,7 @@ use tokio::sync::Notify;
 use zond_engine::export::{ExportOptions, Redaction, schema::HostDto};
 use zond_engine::journal::store;
 use zond_engine::model::ip::scoped::ScopedIp;
+use zond_engine::report::ScanReport;
 use zond_engine::scanner::handle::ScanHandle;
 use zond_engine::scanner::session::{HostStore, Progress, ScanEvent, ScanEvents};
 use zond_engine::{ScanTask, Stage};
@@ -140,6 +141,12 @@ pub struct Scan {
     handle: ScanHandle,
     log: Arc<Log>,
     redaction: Redaction,
+    /// What the scan amounted to, once it is over.
+    ///
+    /// Kept rather than dropped: it is what `Export` writes, and rebuilding it
+    /// from the journal a moment after the engine handed it over would be
+    /// reading back something already in hand.
+    report: Mutex<Option<ScanReport>>,
 }
 
 impl Scan {
@@ -153,10 +160,10 @@ impl Scan {
             cause: (!running).then(|| convert::stop_cause(self.handle.stopped()) as i32),
             progress: Some(self.progress()),
             seq: self.log.watermark(),
-            // Written once the report side lands. A client that wants the
-            // findings reads them off the events until then, which is the same
-            // data arriving as it is found rather than in one piece at the end.
-            report: None,
+            // `report` is deprecated and stays unset: `Export` writes one, in
+            // any of five formats, rather than every answer about how a scan is
+            // going carrying the whole of it.
+            ..Default::default()
         }
     }
 
@@ -338,6 +345,26 @@ impl Found {
         }
     }
 
+    /// What the scan amounted to, or nothing while it is still going.
+    pub fn report(&self) -> Option<ScanReport> {
+        match self {
+            Found::Live(scan) => scan.report(),
+            Found::Recorded(recorded) => Some(recorded.report.clone()),
+        }
+    }
+
+    /// The masking this scan's findings are handed out under.
+    ///
+    /// A scan read back off disk carries none: the journal keeps what was found
+    /// rather than what a reader was allowed to see, so masking it is a decision
+    /// made when it is written out rather than one already made.
+    pub fn redaction(&self) -> Redaction {
+        match self {
+            Found::Live(scan) => scan.redaction,
+            Found::Recorded(_) => Redaction::None,
+        }
+    }
+
     /// Winds the scan down, where there is anything left to wind down.
     pub fn stop(&self) {
         if let Found::Live(scan) = self {
@@ -355,6 +382,7 @@ impl Found {
 pub struct Recorded {
     id: String,
     hosts: Vec<proto::Event>,
+    report: ScanReport,
 }
 
 impl Recorded {
@@ -389,6 +417,7 @@ impl Recorded {
         Ok(Arc::new(Self {
             id: entry.manifest.id,
             hosts,
+            report,
         }))
     }
 
@@ -407,7 +436,7 @@ impl Recorded {
                 overall_total: None,
             }),
             seq: self.hosts.len() as u64,
-            report: None,
+            ..Default::default()
         }
     }
 
@@ -470,6 +499,10 @@ fn follow(scan: Arc<Scan>, mut events: ScanEvents, task: ScanTask) {
 
         let (_, outcome) = tokio::join!(draining, task.join());
 
+        if let Ok(finished) = &outcome {
+            *scan.report.lock().unwrap_or_else(|e| e.into_inner()) = Some(finished.clone());
+        }
+
         // A scan that ran to the end names no cause, and the schema says so out
         // loud rather than leaving a client to read an absent field.
         let cause = match &outcome {
@@ -508,12 +541,21 @@ impl Scan {
             handle,
             log: Arc::new(Log::default()),
             redaction,
+            report: Mutex::new(None),
         }
     }
 
     /// The stage the scan is in, for a caller that wants only that.
     pub fn stage(&self) -> Stage {
         self.progress.stage()
+    }
+
+    /// What the scan amounted to, once there is such a thing.
+    pub fn report(&self) -> Option<ScanReport> {
+        self.report
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 

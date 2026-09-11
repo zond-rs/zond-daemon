@@ -137,6 +137,10 @@ async fn answer<W: AsyncWrite + Unpin>(
             }
             Err(refused) => fail(out, id, &refused).await,
         },
+        "export" => match export(scans, request.params) {
+            Ok(written) => frame(out, json!({"id": id, "result": written})).await,
+            Err(refused) => fail(out, id, &refused).await,
+        },
         "watch" => watch(scans, out, id, request.params).await,
         other => {
             let refused = Error::no_such_method(other);
@@ -152,6 +156,37 @@ async fn start(scans: &Scans, params: Value) -> Result<proto::StartResponse, Err
 
     Ok(proto::StartResponse {
         scan_id: scan.id.clone(),
+    })
+}
+
+/// Writes a finished scan down in whichever format was asked for.
+fn export(scans: &Scans, params: Value) -> Result<proto::ExportResponse, Error> {
+    let asked: proto::ExportRequest = serde_json::from_value(params).map_err(Error::malformed)?;
+    let found = scans.get(&asked.scan_id)?;
+
+    let report = found.report().ok_or_else(|| {
+        Error::new(
+            "scan.still_running",
+            format!(
+                "{} has not finished, so there is nothing to write down yet. Watch it instead.",
+                asked.scan_id
+            ),
+        )
+    })?;
+
+    // Asked for here, or already decided for the scan. A caller that wants one
+    // reader to see less than another says so per export rather than per scan.
+    let redaction = if asked.redact.unwrap_or_default() {
+        zond_engine::export::Redaction::Standard
+    } else {
+        found.redaction()
+    };
+
+    let format = crate::export::named(asked.format);
+
+    Ok(proto::ExportResponse {
+        document: crate::export::document(&report, format, redaction)?,
+        format: format as i32,
     })
 }
 
@@ -422,6 +457,130 @@ mod tests {
         }
 
         assert!(!seen.is_empty(), "a scan that said nothing at all");
+    }
+
+    /// Runs a scan of loopback to the end and hands back a client and its name.
+    async fn a_finished_scan() -> (Client, String) {
+        let mut client = Client::connect(Arc::new(Scans::recording_in(None)));
+
+        client
+            .send(json!({
+                "id": 1,
+                "method": "start",
+                "params": {
+                    "targets": ["127.0.0.1"],
+                    "ports": "9,22",
+                    "assume_up": true,
+                    "service_detection": "SERVICE_DETECTION_OFF"
+                }
+            }))
+            .await;
+
+        let started = client.next().await;
+        let id = started["result"]["scan_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a scan was named: {started}"))
+            .to_string();
+
+        loop {
+            client
+                .send(json!({"id": 9, "method": "get", "params": {"scan_id": id}}))
+                .await;
+
+            if client.next().await["result"]["running"] == json!(false) {
+                return (client, id);
+            }
+        }
+    }
+
+    /// Every format the schema names writes something a reader of that format
+    /// would recognise.
+    ///
+    /// Not a check that the documents are right, which is the engine's own
+    /// conformance suite's job. A check that the name on the wire reaches the
+    /// writer somebody meant, so asking for CSV cannot quietly hand back JSON.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_format_the_schema_names_writes_that_format() {
+        let (mut client, id) = a_finished_scan().await;
+
+        let recognised = [
+            ("EXPORT_FORMAT_JSON", "\"hosts\""),
+            ("EXPORT_FORMAT_JSONL", "{"),
+            ("EXPORT_FORMAT_CSV", ","),
+            ("EXPORT_FORMAT_HTML", "<"),
+            ("EXPORT_FORMAT_NMAP_XML", "<nmaprun"),
+        ];
+
+        for (format, mark) in recognised {
+            client
+                .send(json!({
+                    "id": 2,
+                    "method": "export",
+                    "params": {"scan_id": id, "format": format}
+                }))
+                .await;
+
+            let written = client.next().await;
+            let document = written["result"]["document"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{format} wrote nothing: {written}"));
+
+            assert!(
+                document.contains(mark),
+                "{format} does not look like {format}: {}",
+                &document[..document.len().min(120)]
+            );
+            assert_eq!(
+                written["result"]["format"], format,
+                "the answer says what it wrote"
+            );
+        }
+    }
+
+    /// A caller who named no format gets the one that carries everything.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_caller_who_names_no_format_is_written_json() {
+        let (mut client, id) = a_finished_scan().await;
+
+        client
+            .send(json!({"id": 2, "method": "export", "params": {"scan_id": id}}))
+            .await;
+
+        let written = client.next().await;
+        assert_eq!(
+            written["result"]["format"], "EXPORT_FORMAT_JSON",
+            "{written}"
+        );
+
+        let document = written["result"]["document"].as_str().expect("a document");
+        serde_json::from_str::<Value>(document).expect("and it is JSON");
+    }
+
+    /// A scan still going has nothing written down yet, and is told so rather
+    /// than handed half a report.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scan_that_has_not_finished_has_nothing_to_write_down() {
+        let scans = Scans::recording_in(None);
+        let scan = scans
+            .start(proto::StartRequest {
+                targets: vec!["127.0.0.1".into()],
+                ports: Some("9".into()),
+                assume_up: Some(true),
+                ..Default::default()
+            })
+            .await
+            .expect("a scan");
+
+        assert!(
+            scans
+                .get(&scan.id)
+                .expect("it is running")
+                .report()
+                .is_none(),
+            "a scan that has only just started has amounted to nothing yet"
+        );
+
+        scan.stop();
     }
 
     /// A method nobody wrote is refused by name, under the id that asked.

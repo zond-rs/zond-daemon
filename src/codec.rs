@@ -122,6 +122,7 @@ named!(
     "SCTP scan technique"
 );
 named!(send_mode, proto::SendMode, "send mode");
+named!(export_format, proto::ExportFormat, "export format");
 
 // ╔════════════════════════════════════════════╗
 // ║ ████████╗███████╗███████╗████████╗███████╗ ║

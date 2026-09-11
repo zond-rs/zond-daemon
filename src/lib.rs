@@ -42,6 +42,7 @@
 pub mod codec;
 pub mod convert;
 pub mod error;
+pub mod export;
 pub mod id;
 #[cfg(unix)]
 pub mod listen;

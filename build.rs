@@ -48,6 +48,8 @@ const DEFAULTED: &[&str] = &[
     "zond.v1.StopRequest",
     "zond.v1.ScanState",
     "zond.v1.Error",
+    "zond.v1.ExportRequest",
+    "zond.v1.ExportResponse",
 ];
 
 const ENUM_FIELDS: &[(&str, &str)] = &[
@@ -74,6 +76,8 @@ const ENUM_FIELDS: &[(&str, &str)] = &[
     ("zond.v1.Progress.stage", "stage"),
     ("zond.v1.Finished.cause", "stop_cause"),
     ("zond.v1.ScanState.cause", "stop_cause::optional"),
+    ("zond.v1.ExportRequest.format", "export_format"),
+    ("zond.v1.ExportResponse.format", "export_format"),
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
