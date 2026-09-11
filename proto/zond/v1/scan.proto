@@ -66,7 +66,7 @@ message StartRequest {
   optional OsDetection os_detection = 5;
 
   // The most a detection may do to a target. Absent runs none of them.
-  optional DetectionEnvelope detection = 6;
+  optional DetectionClass detection = 6;
 
   optional bool traceroute = 7;
   optional bool characterise = 8;
@@ -100,9 +100,13 @@ message StartResponse {
 // How hard the engine works to name what is behind an open port.
 enum ServiceDetection {
   SERVICE_DETECTION_UNSPECIFIED = 0;
+  // Nothing is asked. A port's state is read and no connection is opened.
   SERVICE_DETECTION_OFF = 1;
-  SERVICE_DETECTION_LIGHT = 2;
-  SERVICE_DETECTION_BALANCED = 3;
+  // Whatever a service volunteers on connect, and nothing more.
+  SERVICE_DETECTION_BANNER = 2;
+  // Probes chosen for the port, for a service that says nothing unprompted.
+  SERVICE_DETECTION_PROBE = 3;
+  // Every probe that might apply, in exchange for taking longer.
   SERVICE_DETECTION_THOROUGH = 4;
 }
 
@@ -115,17 +119,24 @@ enum OsDetection {
   OS_DETECTION_AGGRESSIVE = 4;
 }
 
-// The most a detection is permitted to do to a target.
+// What a detection does to the target it runs against.
 //
-// Ordered by what it costs the target rather than by what it finds. A caller
-// scanning somebody else's network picks the ceiling they are authorised to
-// reach and the engine runs nothing above it.
-enum DetectionEnvelope {
-  DETECTION_ENVELOPE_UNSPECIFIED = 0;
-  DETECTION_ENVELOPE_NONE = 1;
-  DETECTION_ENVELOPE_SAFE = 2;
-  DETECTION_ENVELOPE_INTRUSIVE = 3;
-  DETECTION_ENVELOPE_EXPLOIT = 4;
+// Ordered by what it costs that target rather than by what it finds. A caller
+// names the most they are authorised to do and the engine runs nothing above it.
+// Leaving the field unset runs no detections at all, which is why there is no
+// value here meaning none: absent already says it.
+enum DetectionClass {
+  DETECTION_CLASS_UNSPECIFIED = 0;
+  // Reads what the scan already gathered. Sends nothing of its own.
+  DETECTION_CLASS_PASSIVE = 1;
+  // Asks the service a question it is meant to answer.
+  DETECTION_CLASS_ACTIVE_BENIGN = 2;
+  // Changes something on the target, however small.
+  DETECTION_CLASS_ACTIVE_MUTATING = 3;
+  // Proves a vulnerability by using it.
+  DETECTION_CLASS_EXPLOIT = 4;
+  // Can take the service down, and is never reached by accident.
+  DETECTION_CLASS_DOS = 5;
 }
 
 // What a probe looks like on the wire, for a scan that would rather not look
@@ -152,11 +163,15 @@ message Settings {
   optional bool tls_enumeration = 9;
 }
 
+// How much the engine spends on being sure, against how long it takes.
 enum ScanEffort {
   SCAN_EFFORT_UNSPECIFIED = 0;
-  SCAN_EFFORT_POLITE = 1;
-  SCAN_EFFORT_BALANCED = 2;
-  SCAN_EFFORT_AGGRESSIVE = 3;
+  // One probe per target. Fastest, and least sure about a target that was busy.
+  SCAN_EFFORT_SINGLE = 1;
+  SCAN_EFFORT_FAST = 2;
+  SCAN_EFFORT_BALANCED = 3;
+  // Every retry the policy allows, for a network that drops probes.
+  SCAN_EFFORT_THOROUGH = 4;
 }
 
 // ── Following ───────────────────────────────────────────────────────────────

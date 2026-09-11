@@ -19,6 +19,8 @@
 //! a client as a number nothing can name.
 
 use zond_engine::Stage;
+use zond_engine::config::{OsDetection, ScanEffort, ServiceDetection};
+use zond_engine::model::finding::DetectionClass;
 use zond_engine::scanner::handle::StopCause;
 
 use crate::proto;
@@ -54,6 +56,101 @@ pub fn stop_cause(cause: Option<StopCause>) -> proto::StopCause {
         Some(StopCause::Aborted) => proto::StopCause::Aborted,
         Some(StopCause::TimedOut) => proto::StopCause::TimedOut,
         _ => proto::StopCause::Unspecified,
+    }
+}
+
+/// The schema's name for how hard the engine looks at a service.
+pub fn service_detection(level: ServiceDetection) -> proto::ServiceDetection {
+    match level {
+        ServiceDetection::Off => proto::ServiceDetection::Off,
+        ServiceDetection::Banner => proto::ServiceDetection::Banner,
+        ServiceDetection::Probe => proto::ServiceDetection::Probe,
+        ServiceDetection::Thorough => proto::ServiceDetection::Thorough,
+        _ => proto::ServiceDetection::Unspecified,
+    }
+}
+
+/// What the engine reads the schema's name as. `None` where the field was left
+/// unset, which leaves the engine's own default standing.
+pub fn service_detection_of(named: proto::ServiceDetection) -> Option<ServiceDetection> {
+    match named {
+        proto::ServiceDetection::Unspecified => None,
+        proto::ServiceDetection::Off => Some(ServiceDetection::Off),
+        proto::ServiceDetection::Banner => Some(ServiceDetection::Banner),
+        proto::ServiceDetection::Probe => Some(ServiceDetection::Probe),
+        proto::ServiceDetection::Thorough => Some(ServiceDetection::Thorough),
+    }
+}
+
+/// The schema's name for whether a host is asked what it runs.
+pub fn os_detection(level: OsDetection) -> proto::OsDetection {
+    match level {
+        OsDetection::Off => proto::OsDetection::Off,
+        OsDetection::Passive => proto::OsDetection::Passive,
+        OsDetection::Active => proto::OsDetection::Active,
+        OsDetection::Aggressive => proto::OsDetection::Aggressive,
+        _ => proto::OsDetection::Unspecified,
+    }
+}
+
+/// What the engine reads the schema's name as.
+pub fn os_detection_of(named: proto::OsDetection) -> Option<OsDetection> {
+    match named {
+        proto::OsDetection::Unspecified => None,
+        proto::OsDetection::Off => Some(OsDetection::Off),
+        proto::OsDetection::Passive => Some(OsDetection::Passive),
+        proto::OsDetection::Active => Some(OsDetection::Active),
+        proto::OsDetection::Aggressive => Some(OsDetection::Aggressive),
+    }
+}
+
+/// The schema's name for what a detection does to its target.
+pub fn detection_class(class: DetectionClass) -> proto::DetectionClass {
+    match class {
+        DetectionClass::Passive => proto::DetectionClass::Passive,
+        DetectionClass::ActiveBenign => proto::DetectionClass::ActiveBenign,
+        DetectionClass::ActiveMutating => proto::DetectionClass::ActiveMutating,
+        DetectionClass::Exploit => proto::DetectionClass::Exploit,
+        DetectionClass::Dos => proto::DetectionClass::Dos,
+        _ => proto::DetectionClass::Unspecified,
+    }
+}
+
+/// What the engine reads the schema's name as.
+///
+/// `None` is a request that named no ceiling, which runs no detections. That is
+/// the reason the schema has no value meaning none: an absent field already says
+/// it, and a second way to say the same thing is a second thing to get wrong.
+pub fn detection_class_of(named: proto::DetectionClass) -> Option<DetectionClass> {
+    match named {
+        proto::DetectionClass::Unspecified => None,
+        proto::DetectionClass::Passive => Some(DetectionClass::Passive),
+        proto::DetectionClass::ActiveBenign => Some(DetectionClass::ActiveBenign),
+        proto::DetectionClass::ActiveMutating => Some(DetectionClass::ActiveMutating),
+        proto::DetectionClass::Exploit => Some(DetectionClass::Exploit),
+        proto::DetectionClass::Dos => Some(DetectionClass::Dos),
+    }
+}
+
+/// The schema's name for how much a scan spends on being sure.
+pub fn scan_effort(effort: ScanEffort) -> proto::ScanEffort {
+    match effort {
+        ScanEffort::Single => proto::ScanEffort::Single,
+        ScanEffort::Fast => proto::ScanEffort::Fast,
+        ScanEffort::Balanced => proto::ScanEffort::Balanced,
+        ScanEffort::Thorough => proto::ScanEffort::Thorough,
+        _ => proto::ScanEffort::Unspecified,
+    }
+}
+
+/// What the engine reads the schema's name as.
+pub fn scan_effort_of(named: proto::ScanEffort) -> Option<ScanEffort> {
+    match named {
+        proto::ScanEffort::Unspecified => None,
+        proto::ScanEffort::Single => Some(ScanEffort::Single),
+        proto::ScanEffort::Fast => Some(ScanEffort::Fast),
+        proto::ScanEffort::Balanced => Some(ScanEffort::Balanced),
+        proto::ScanEffort::Thorough => Some(ScanEffort::Thorough),
     }
 }
 
@@ -104,6 +201,105 @@ mod tests {
             before,
             "two stages share one name in the schema"
         );
+    }
+
+    /// Every level the engine accepts survives the trip to the schema and back.
+    ///
+    /// The round trip is what makes this worth writing. A value with no name in
+    /// the schema fails the first assertion, and a value that answers to the
+    /// wrong name fails the second, and the second is the one nothing else in
+    /// either repository would have noticed: `SERVICE_DETECTION_BALANCED`
+    /// reaching the engine as `Thorough` is a scan that quietly does more than
+    /// it was asked to.
+    #[test]
+    fn every_service_detection_level_survives_the_round_trip() {
+        for level in ServiceDetection::ALL {
+            let named = service_detection(level);
+
+            assert_ne!(
+                named,
+                proto::ServiceDetection::Unspecified,
+                "the engine accepts {level:?} and the schema has no name for it"
+            );
+            assert_eq!(
+                service_detection_of(named),
+                Some(level),
+                "{level:?} came back as something else"
+            );
+        }
+    }
+
+    #[test]
+    fn every_os_detection_level_survives_the_round_trip() {
+        for level in OsDetection::ALL {
+            let named = os_detection(level);
+
+            assert_ne!(
+                named,
+                proto::OsDetection::Unspecified,
+                "the engine accepts {level:?} and the schema has no name for it"
+            );
+            assert_eq!(
+                os_detection_of(named),
+                Some(level),
+                "{level:?} came back as something else"
+            );
+        }
+    }
+
+    /// Every class survives, which is the one of these four where being wrong
+    /// costs more than a slow scan.
+    ///
+    /// The classes are a ceiling on what a detection may do to somebody else's
+    /// machine. A caller authorising up to `ACTIVE_BENIGN` and having it read as
+    /// `EXPLOIT` is the engine doing something nobody permitted.
+    #[test]
+    fn every_detection_class_survives_the_round_trip() {
+        for class in DetectionClass::ALL {
+            let named = detection_class(class);
+
+            assert_ne!(
+                named,
+                proto::DetectionClass::Unspecified,
+                "the engine accepts {class:?} and the schema has no name for it"
+            );
+            assert_eq!(
+                detection_class_of(named),
+                Some(class),
+                "{class:?} came back as something else"
+            );
+        }
+    }
+
+    #[test]
+    fn every_scan_effort_survives_the_round_trip() {
+        for effort in ScanEffort::ALL {
+            let named = scan_effort(effort);
+
+            assert_ne!(
+                named,
+                proto::ScanEffort::Unspecified,
+                "the engine accepts {effort:?} and the schema has no name for it"
+            );
+            assert_eq!(
+                scan_effort_of(named),
+                Some(effort),
+                "{effort:?} came back as something else"
+            );
+        }
+    }
+
+    /// An unset field leaves the engine's own default standing, rather than
+    /// being read as the first value the schema happens to declare.
+    #[test]
+    fn an_unset_level_is_not_a_level() {
+        assert_eq!(
+            service_detection_of(proto::ServiceDetection::Unspecified),
+            None
+        );
+        assert_eq!(os_detection_of(proto::OsDetection::Unspecified), None);
+        assert_eq!(detection_class_of(proto::DetectionClass::Unspecified), None);
+        assert_eq!(scan_effort_of(proto::ScanEffort::Unspecified), None);
     }
 
     /// A scan that simply finished says so, rather than saying nothing.
