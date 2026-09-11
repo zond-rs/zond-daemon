@@ -95,6 +95,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.type_attribute(message, "#[serde(default)]");
     }
 
+    // What happened, said the way the schema says it.
+    //
+    // The generated oneof is a Rust enum, and serde writes one as a map keyed by
+    // the variant's Rust name, so an event would arrive as
+    // `{"body":{"StageChanged":…}}`. Flattened and renamed it arrives as
+    // `{"seq":3,"stage":…}`, which is the name the schema gives that arm and the
+    // one a reader of the schema goes looking for.
+    config
+        .type_attribute("zond.v1.Event.body", "#[serde(rename_all = \"snake_case\")]")
+        .field_attribute("zond.v1.Event.body", "#[serde(flatten)]");
+
     for (field, module) in ENUM_FIELDS {
         config.field_attribute(
             field,

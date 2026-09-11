@@ -19,6 +19,7 @@
 //! → {"id":2,"method":"watch","params":{"scan_id":"0GBQK4W7M8001"}}
 //! ← {"id":2,"event":{"seq":1,"host":{"address":"10.0.0.1","document":"{…}"}}}
 //! ← {"id":2,"event":{"seq":2,"stage":{"stage":"STAGE_PORTS"}}}
+//! ← {"id":2,"event":{"seq":3,"progress":{"stage":"STAGE_PORTS","overall_done":1,"overall_total":8}}}
 //! ← {"id":2,"end":true}
 //! ```
 //!
