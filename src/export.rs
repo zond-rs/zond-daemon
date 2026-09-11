@@ -15,10 +15,13 @@
 //! Every one of them is text, so a document crosses the wire as a string rather
 //! than as something a client has to decode first.
 
+use zond_engine::diff::ScanDiff;
+use zond_engine::export::diff::{DiffExporter, HtmlDiffExporter, JsonDiffExporter};
 use zond_engine::export::{
     CsvExporter, ExportOptions, Exporter, HtmlExporter, JsonExporter, JsonLinesExporter,
     NmapXmlExporter, Redaction,
 };
+use zond_engine::merge::{Merge, MergeOptions};
 use zond_engine::report::ScanReport;
 
 use crate::error::Error;
@@ -68,4 +71,59 @@ pub fn named(raw: i32) -> proto::ExportFormat {
         Ok(proto::ExportFormat::Unspecified) | Err(_) => proto::ExportFormat::Json,
         Ok(format) => format,
     }
+}
+
+/// Writes what changed between two scans.
+///
+/// Its own two formats rather than the report's five: a comparison is a
+/// different shape, and there is no sensible row of a table or line of nmap XML
+/// for "this port closed".
+pub fn comparison(
+    baseline: &ScanReport,
+    current: &ScanReport,
+    format: proto::DiffFormat,
+) -> Result<String, Error> {
+    let difference = ScanDiff::between(baseline, current);
+
+    let writer: Box<dyn DiffExporter> = match format {
+        proto::DiffFormat::Unspecified | proto::DiffFormat::Json => {
+            Box::new(JsonDiffExporter::default())
+        }
+        proto::DiffFormat::Html => Box::new(HtmlDiffExporter::default()),
+    };
+
+    let mut written = Vec::new();
+    writer
+        .export(&difference, &mut written)
+        .map_err(Error::engine)?;
+
+    String::from_utf8(written).map_err(|_| {
+        Error::new(
+            "export.not_text",
+            "the engine wrote a comparison that is not text, which should not happen",
+        )
+    })
+}
+
+/// The comparison format a caller asked for, resolved to the one that will be
+/// written.
+pub fn compared(raw: i32) -> proto::DiffFormat {
+    match proto::DiffFormat::try_from(raw) {
+        Ok(proto::DiffFormat::Unspecified) | Err(_) => proto::DiffFormat::Json,
+        Ok(format) => format,
+    }
+}
+
+/// Folds several scans into one report.
+///
+/// Named as it folds, so the folded report says which documents it was made of
+/// rather than presenting itself as a single run that covered all of them.
+pub fn folded(reports: Vec<(String, ScanReport)>) -> ScanReport {
+    let mut fold = Merge::new(MergeOptions::default());
+
+    for (name, report) in reports {
+        fold.add_from(name, report);
+    }
+
+    fold.finish()
 }

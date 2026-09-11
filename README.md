@@ -53,6 +53,9 @@ Both speak the same protocol: one JSON object per line, in and out.
 | `export` | write a finished one down as JSON, JSONL, CSV, HTML or nmap XML |
 | `list` | the scans this daemon has a record of, newest first |
 | `prune` | throw away the records nobody asked to keep |
+| `resume` | continue one that stopped part way, from the plan in its record |
+| `diff` | what changed between two of them |
+| `merge` | several folded into one report |
 
 `watch` takes a cursor rather than being a subscription that only runs forward
 from now, so a client that went away and came back passes the sequence number it

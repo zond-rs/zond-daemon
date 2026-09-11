@@ -137,6 +137,18 @@ async fn answer<W: AsyncWrite + Unpin>(
             }
             Err(refused) => fail(out, id, &refused).await,
         },
+        "resume" => match resume(scans, request.params).await {
+            Ok(started) => frame(out, json!({"id": id, "result": started})).await,
+            Err(refused) => fail(out, id, &refused).await,
+        },
+        "diff" => match difference(scans, request.params) {
+            Ok(compared) => frame(out, json!({"id": id, "result": compared})).await,
+            Err(refused) => fail(out, id, &refused).await,
+        },
+        "merge" => match folded(scans, request.params) {
+            Ok(written) => frame(out, json!({"id": id, "result": written})).await,
+            Err(refused) => fail(out, id, &refused).await,
+        },
         "prune" => match prune(scans, request.params) {
             Ok(pruned) => frame(out, json!({"id": id, "result": pruned})).await,
             Err(refused) => fail(out, id, &refused).await,
@@ -164,6 +176,71 @@ async fn start(scans: &Scans, params: Value) -> Result<proto::StartResponse, Err
 
     Ok(proto::StartResponse {
         scan_id: scan.id.clone(),
+    })
+}
+
+/// Continues a scan that stopped part way.
+async fn resume(scans: &Scans, params: Value) -> Result<proto::StartResponse, Error> {
+    let asked: proto::ResumeRequest = serde_json::from_value(params).map_err(Error::malformed)?;
+    let scan = scans.resume(&asked.scan_id).await?;
+
+    Ok(proto::StartResponse {
+        scan_id: scan.id.clone(),
+    })
+}
+
+/// What changed between two scans.
+fn difference(scans: &Scans, params: Value) -> Result<proto::DiffResponse, Error> {
+    let asked: proto::DiffRequest = serde_json::from_value(params).map_err(Error::malformed)?;
+
+    let baseline = finished(scans, &asked.baseline_id)?;
+    let current = finished(scans, &asked.current_id)?;
+    let format = crate::export::compared(asked.format);
+
+    Ok(proto::DiffResponse {
+        document: crate::export::comparison(&baseline, &current, format)?,
+        format: format as i32,
+    })
+}
+
+/// Several scans folded into one report.
+fn folded(scans: &Scans, params: Value) -> Result<proto::ExportResponse, Error> {
+    let asked: proto::MergeRequest = serde_json::from_value(params).map_err(Error::malformed)?;
+
+    if asked.scan_ids.len() < 2 {
+        return Err(Error::new(
+            "request.too_few_scans",
+            "folding takes two scans or more; one scan is already a report",
+        ));
+    }
+
+    let mut reports = Vec::with_capacity(asked.scan_ids.len());
+    for id in &asked.scan_ids {
+        reports.push((id.clone(), finished(scans, id)?));
+    }
+
+    let one = crate::export::folded(reports);
+    let format = crate::export::named(asked.format);
+
+    let redaction = if asked.redact.unwrap_or_default() {
+        zond_engine::export::Redaction::Standard
+    } else {
+        zond_engine::export::Redaction::None
+    };
+
+    Ok(proto::ExportResponse {
+        document: crate::export::document(&one, format, redaction)?,
+        format: format as i32,
+    })
+}
+
+/// A scan's report, for the calls that only make sense once it is over.
+fn finished(scans: &Scans, id: &str) -> Result<zond_engine::ScanReport, Error> {
+    scans.get(id)?.report().ok_or_else(|| {
+        Error::new(
+            "scan.still_running",
+            format!("{id} has not finished, so there is nothing to read from it yet."),
+        )
     })
 }
 
@@ -481,6 +558,105 @@ mod tests {
         }
 
         assert!(!seen.is_empty(), "a scan that said nothing at all");
+    }
+
+    /// Runs one more scan of loopback to the end on a client already connected.
+    async fn one_more(client: &mut Client, id: u32) -> String {
+        client
+            .send(json!({
+                "id": id,
+                "method": "start",
+                "params": {
+                    "targets": ["127.0.0.1"],
+                    "ports": "9,22",
+                    "assume_up": true,
+                    "service_detection": "SERVICE_DETECTION_OFF"
+                }
+            }))
+            .await;
+
+        let started = client.next().await;
+        let name = started["result"]["scan_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a scan was named: {started}"))
+            .to_string();
+
+        loop {
+            client
+                .send(json!({"id": 99, "method": "get", "params": {"scan_id": name}}))
+                .await;
+
+            if client.next().await["result"]["running"] == json!(false) {
+                return name;
+            }
+        }
+    }
+
+    /// What changed between two scans, in both the shapes a comparison has.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_scans_are_compared_in_either_shape() {
+        let mut client = Client::connect(Arc::new(Scans::recording_in(None)));
+        let before = one_more(&mut client, 1).await;
+        let after = one_more(&mut client, 2).await;
+
+        for (format, mark) in [("DIFF_FORMAT_JSON", "{"), ("DIFF_FORMAT_HTML", "<")] {
+            client
+                .send(json!({
+                    "id": 3,
+                    "method": "diff",
+                    "params": {"baseline_id": before, "current_id": after, "format": format}
+                }))
+                .await;
+
+            let compared = client.next().await;
+            let document = compared["result"]["document"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{format} compared nothing: {compared}"));
+
+            assert!(document.starts_with(mark), "{format}: {document:.80}");
+            assert_eq!(compared["result"]["format"], format);
+        }
+    }
+
+    /// Two scans folded into one report, which is a report and writes like one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scans_are_folded_into_one_report() {
+        let mut client = Client::connect(Arc::new(Scans::recording_in(None)));
+        let first = one_more(&mut client, 1).await;
+        let second = one_more(&mut client, 2).await;
+
+        client
+            .send(json!({
+                "id": 3,
+                "method": "merge",
+                "params": {"scan_ids": [first, second], "format": "EXPORT_FORMAT_JSON"}
+            }))
+            .await;
+
+        let folded = client.next().await;
+        let document = folded["result"]["document"]
+            .as_str()
+            .unwrap_or_else(|| panic!("nothing was folded: {folded}"));
+
+        let read: Value = serde_json::from_str(document).expect("a report");
+        assert!(read["hosts"].is_array(), "and it is one: {document:.120}");
+    }
+
+    /// One scan is already a report, so folding asks for two.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn folding_one_scan_is_refused() {
+        let mut client = Client::connect(Arc::new(Scans::recording_in(None)));
+        let only = one_more(&mut client, 1).await;
+
+        client
+            .send(json!({"id": 2, "method": "merge", "params": {"scan_ids": [only]}}))
+            .await;
+
+        let refused = client.next().await;
+        assert_eq!(
+            refused["error"]["code"], "request.too_few_scans",
+            "{refused}"
+        );
     }
 
     /// Runs a scan of loopback to the end and hands back a client and its name.

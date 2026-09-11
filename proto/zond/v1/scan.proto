@@ -59,6 +59,19 @@ service Scans {
   // daemon that keeps every one of them forever fills a disk. This is how an
   // operator says which are worth keeping.
   rpc Prune(PruneRequest) returns (PruneResponse);
+
+  // Continues a scan that stopped part way.
+  //
+  // The plan comes from the record rather than from this call, which is what
+  // makes it the same job: the targets, the ports and the order are the ones the
+  // first sitting was working through, and what it settled is not asked again.
+  rpc Resume(ResumeRequest) returns (StartResponse);
+
+  // What changed between two scans.
+  rpc Diff(DiffRequest) returns (DiffResponse);
+
+  // Several scans folded into one report.
+  rpc Merge(MergeRequest) returns (ExportResponse);
 }
 
 // ── Starting ────────────────────────────────────────────────────────────────
@@ -551,6 +564,47 @@ message PruneResponse {
 message HeldRecord {
   string scan_id = 1;
   string reason = 2;
+}
+
+// ── Continuing, comparing, folding ──────────────────────────────────────────
+
+message ResumeRequest {
+  // The scan to continue. It has to be one this daemon has a record of, and one
+  // no other process is running.
+  string scan_id = 1;
+}
+
+message DiffRequest {
+  // What the network looked like before, and what it looks like now. Both are
+  // scans this daemon has a record of.
+  string baseline_id = 1;
+  string current_id = 2;
+
+  DiffFormat format = 3;
+}
+
+message DiffResponse {
+  string document = 1;
+  DiffFormat format = 2;
+}
+
+// A comparison is its own shape, so it has its own two formats rather than the
+// five a report has.
+enum DiffFormat {
+  DIFF_FORMAT_UNSPECIFIED = 0;
+  DIFF_FORMAT_JSON = 1;
+  DIFF_FORMAT_HTML = 2;
+}
+
+message MergeRequest {
+  // The scans to fold together, in the order they should be folded. Two or more.
+  repeated string scan_ids = 1;
+
+  // The folded report is a report, so it is written in the same five formats
+  // any other is.
+  ExportFormat format = 2;
+
+  optional bool redact = 3;
 }
 
 // ── Failing ─────────────────────────────────────────────────────────────────

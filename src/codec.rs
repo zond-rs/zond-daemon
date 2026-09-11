@@ -125,6 +125,7 @@ named!(send_mode, proto::SendMode, "send mode");
 named!(export_format, proto::ExportFormat, "export format");
 named!(scan_kind, proto::ScanKind, "scan kind");
 named!(scan_hold, proto::ScanHold, "scan hold");
+named!(diff_format, proto::DiffFormat, "diff format");
 
 // ╔════════════════════════════════════════════╗
 // ║ ████████╗███████╗███████╗████████╗███████╗ ║

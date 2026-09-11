@@ -56,6 +56,10 @@ const DEFAULTED: &[&str] = &[
     "zond.v1.PruneRequest",
     "zond.v1.PruneResponse",
     "zond.v1.HeldRecord",
+    "zond.v1.ResumeRequest",
+    "zond.v1.DiffRequest",
+    "zond.v1.DiffResponse",
+    "zond.v1.MergeRequest",
 ];
 
 const ENUM_FIELDS: &[(&str, &str)] = &[
@@ -86,6 +90,9 @@ const ENUM_FIELDS: &[(&str, &str)] = &[
     ("zond.v1.ExportResponse.format", "export_format"),
     ("zond.v1.ScanListing.kind", "scan_kind"),
     ("zond.v1.StartRequest.kind", "scan_kind"),
+    ("zond.v1.DiffRequest.format", "diff_format"),
+    ("zond.v1.DiffResponse.format", "diff_format"),
+    ("zond.v1.MergeRequest.format", "export_format"),
     ("zond.v1.ScanListing.hold", "scan_hold"),
 ];
 

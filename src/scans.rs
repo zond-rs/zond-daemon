@@ -277,6 +277,26 @@ impl Scans {
     /// Starts a scan and files it under a name of its own.
     pub async fn start(&self, request: proto::StartRequest) -> Result<Arc<Scan>, Error> {
         let started = crate::start::scan(request, self.root.as_deref()).await?;
+
+        Ok(self.file(started))
+    }
+
+    /// Continues a scan that stopped part way.
+    ///
+    /// Only one this daemon has a record of: the plan comes from that record,
+    /// so a daemon keeping none has nothing to continue from.
+    pub async fn resume(&self, id: &str) -> Result<Arc<Scan>, Error> {
+        let Some(root) = self.root.as_deref() else {
+            return Err(Error::no_such_scan(id));
+        };
+
+        let started = crate::start::resume(id, root).await?;
+
+        Ok(self.file(started))
+    }
+
+    /// Files a started scan under its name and sets its follower going.
+    fn file(&self, started: Started) -> Arc<Scan> {
         let scan = Arc::new(started.scan);
 
         self.inner
@@ -286,7 +306,7 @@ impl Scans {
 
         follow(scan.clone(), started.events, started.task);
 
-        Ok(scan)
+        scan
     }
 
     /// The scans this daemon has a record of, newest first.
@@ -878,6 +898,54 @@ mod tests {
         assert!(
             scans.list(None).expect("a listing").is_empty(),
             "and the record is gone"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A scan that is over can be continued, and continuing it is the same job
+    /// rather than a new one.
+    ///
+    /// Everything it settled is settled, so the second sitting has nothing left
+    /// to ask and ends at once. What it proves is that the record holds enough
+    /// to pick the job back up: the plan, the technique and the cursor.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recorded_scan_can_be_continued_under_its_own_name() {
+        let root = somewhere();
+        let scans = Scans::recording_in(Some(root.clone()));
+
+        let first = scans.start(loopback()).await.expect("a scan");
+        finished(&first).await;
+        let id = first.id.clone();
+
+        let again = scans
+            .resume(&id)
+            .await
+            .unwrap_or_else(|refused| panic!("continuing {id}: {refused}"));
+
+        assert_eq!(again.id, id, "the same job, so the same name");
+        finished(&again).await;
+        assert!(!again.state().running);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A name no record answers to cannot be continued.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scan_with_no_record_cannot_be_continued() {
+        let root = somewhere();
+        let scans = Scans::recording_in(Some(root.clone()));
+
+        let refused = scans
+            .resume("0000000000000000")
+            .await
+            .expect_err("a name nothing answers to");
+        assert_eq!(refused.code(), "scan.unknown");
+
+        // And a daemon that records nothing has nothing to continue at all.
+        assert!(
+            Scans::recording_in(None).resume("anything").await.is_err(),
+            "nothing is written down, so nothing is there to pick up"
         );
 
         std::fs::remove_dir_all(&root).ok();

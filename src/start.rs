@@ -267,6 +267,85 @@ fn watching(links: &[String]) -> String {
     format!("listening on {}", links.join(", "))
 }
 
+/// Continues a scan that stopped part way.
+///
+/// The plan comes from the record rather than from the caller, which is what
+/// makes it the same job rather than a new one that looks like it: the targets,
+/// the ports and the order are the first sitting's, and what that sitting
+/// settled is not asked again. The engine holds it to that, refusing a resume
+/// whose plan has moved.
+pub async fn resume(id: &str, root: &Path) -> Result<Started, Error> {
+    let entry = store::list(root)
+        .map_err(Error::engine)?
+        .into_iter()
+        .find(|entry| entry.manifest.id == id)
+        .ok_or_else(|| Error::no_such_scan(id))?;
+
+    let (journal, _settled, plan) =
+        Journal::reopen(&entry.directory, Privilege::current()).map_err(Error::engine)?;
+
+    // The technique the first sitting used, not this build's default. A resume
+    // that switched from SYN to FIN half way through would be two scans wearing
+    // one name.
+    let mut config = ZondConfig::default();
+    config.tcp_technique = journal.manifest().technique();
+
+    let id = journal.manifest().id.clone();
+
+    match plan.kind() {
+        ScanKind::PortScan => {
+            let map = plan
+                .targets()
+                .cloned()
+                .ok_or_else(|| holds_no(&id, "targets"))?;
+
+            let (session, task) =
+                zond_engine::scan_with_journal(map, &config, Detections::embedded(), journal)
+                    .await
+                    .map_err(Error::engine)?;
+
+            Ok(started(id, session, task, &config))
+        }
+        ScanKind::Discovery => {
+            let addresses = plan
+                .addresses()
+                .cloned()
+                .ok_or_else(|| holds_no(&id, "addresses"))?;
+
+            let (session, task) = zond_engine::discover_with_journal(addresses, &config, journal)
+                .await
+                .map_err(Error::engine)?;
+
+            Ok(started(id, session, task, &config))
+        }
+        ScanKind::Listen => {
+            let zones = plan
+                .links()
+                .map(<[_]>::to_vec)
+                .ok_or_else(|| holds_no(&id, "links"))?;
+
+            let scope = ListenScope::on(zones).recording_everything();
+            let (session, task) = zond_engine::listen_with_journal(scope, &config, journal)
+                .await
+                .map_err(Error::engine)?;
+
+            Ok(started(id, session, task, &config))
+        }
+        other => Err(Error::new(
+            "scan.wrong_phase",
+            format!("{id} is a {other} and this build cannot continue one"),
+        )),
+    }
+}
+
+/// A record whose plan does not hold what continuing it would need.
+fn holds_no(id: &str, wanted: &'static str) -> Error {
+    Error::new(
+        "scan.wrong_phase",
+        format!("the record of {id} holds no {wanted} to continue from"),
+    )
+}
+
 /// Opens a journal for this scan, or none where the machine will not have one.
 ///
 /// A run that cannot be recorded is still a run. The engine draws the same line
