@@ -43,6 +43,8 @@ pub mod codec;
 pub mod convert;
 pub mod error;
 pub mod id;
+#[cfg(unix)]
+pub mod listen;
 pub mod scans;
 pub mod start;
 pub mod stdio;

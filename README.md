@@ -26,6 +26,34 @@ rather than as a second description of the same documents written in proto. That
 schema is published, versioned, and held to the engine's output by a conformance
 test. One contract per thing, each in the form that thing is already written in.
 
+## Running it
+
+```bash
+zondd --stdio                  # for a client that started this process
+zondd --listen /run/zond.sock  # for a client that could not
+```
+
+Both speak the same protocol: one JSON object per line, in and out.
+
+```text
+→ {"id":1,"method":"start","params":{"targets":["10.0.0.0/24"],"ports":"22,80"}}
+← {"id":1,"result":{"scan_id":"0GBQK4W7M8001"}}
+→ {"id":2,"method":"watch","params":{"scan_id":"0GBQK4W7M8001"}}
+← {"id":2,"event":{"seq":1,"stage":{"stage":"STAGE_PORTS"}}}
+← {"id":2,"event":{"seq":2,"host":{"address":"10.0.0.1","document":"{…}"}}}
+← {"id":2,"end":true}
+```
+
+`watch` takes a cursor rather than being a subscription that only runs forward
+from now, so a client that went away and came back passes the sequence number it
+reached and misses nothing. From zero it gets every host as it stands before the
+live tail begins.
+
+The socket is created readable and writable by the user running the daemon and
+nobody else. A process that can put arbitrary packets on the wire is not one to
+hand to every account on the machine, so sharing it with another container is
+something an operator does on purpose.
+
 ## Status
 
 Pre-release. The schema is pinned and linted, and the conversion between the
@@ -33,8 +61,9 @@ engine's vocabulary and the schema's is covered by tests that walk the engine's
 own lists, so a value added upstream fails a build here rather than reaching a
 client as a number nothing can name.
 
-No transport yet. The first will be newline-delimited JSON over a pipe, which
-needs no port, no TLS and no authentication, and can be driven from a shell.
+A scan's log lives in memory and goes when the process does. Its durable form is
+the journal the engine already writes, which is what will make watching a scan
+that finished last week the same call as watching one still running.
 
 ## Building
 

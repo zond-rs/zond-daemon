@@ -103,7 +103,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `{"seq":3,"stage":…}`, which is the name the schema gives that arm and the
     // one a reader of the schema goes looking for.
     config
-        .type_attribute("zond.v1.Event.body", "#[serde(rename_all = \"snake_case\")]")
+        .type_attribute(
+            "zond.v1.Event.body",
+            "#[serde(rename_all = \"snake_case\")]",
+        )
         .field_attribute("zond.v1.Event.body", "#[serde(flatten)]");
 
     for (field, module) in ENUM_FIELDS {
