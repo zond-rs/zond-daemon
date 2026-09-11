@@ -1,0 +1,67 @@
+name: image
+
+# On a tag, because an image is a release. Nothing here runs on a push or a
+# pull request: the build is the same one `rust.yml` already does on every
+# change, and publishing it on every change would be publishing a version
+# nobody asked for.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      engine_ref:
+        description: The zond-engine ref to build against.
+        default: main
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    name: Build and publish
+    runs-on: ubuntu-latest
+
+    steps:
+      # Both repositories, side by side, because this crate builds against the
+      # engine on disk beside it. The same arrangement `rust.yml` makes, and
+      # what `../zond-engine` in Cargo.toml resolves to.
+      - uses: actions/checkout@v4
+        with:
+          path: zond-daemon
+
+      - uses: actions/checkout@v4
+        with:
+          repository: zond-rs/zond-engine
+          ref: ${{ inputs.engine_ref || 'main' }}
+          path: zond-engine
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: named
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          # `0.1.0` and `0.1`, and no `latest`: an image that moves under a tag
+          # somebody deployed is one they cannot reproduce.
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      # The context is the workspace, which holds both checkouts, and the
+      # dockerfile is named inside one of them. One architecture, the runner's:
+      # building the other under emulation costs more than it is worth until
+      # somebody asks for it.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: zond-daemon/Dockerfile
+          push: true
+          tags: ${{ steps.named.outputs.tags }}
+          labels: ${{ steps.named.outputs.labels }}

@@ -15,16 +15,18 @@
 //!
 //! ## The order matters and is the whole design
 //!
-//! 1. The targets are resolved, so what follows is judged on addresses rather
+//! 1. A slot is claimed among however many scans the daemon runs at once. A
+//!    request arriving when there is none ends here, having read nothing.
+//! 2. The targets are resolved, so what follows is judged on addresses rather
 //!    than on the words a request named them with.
-//! 2. The policy is applied to those addresses. A refusal is written down and
+//! 3. The policy is applied to those addresses. A refusal is written down and
 //!    the request ends here.
-//! 3. The scan is recorded, which is what gives it a name.
-//! 4. The start is written down, under that name.
-//! 5. Only then does anything reach the wire.
+//! 4. The scan is recorded, which is what gives it a name.
+//! 5. The start is written down, under that name.
+//! 6. Only then does anything reach the wire.
 //!
-//! Four before five is what makes the audit worth having: a scan that could not
-//! be written down does not happen. Two before three is what keeps a refused
+//! Five before six is what makes the audit worth having: a scan that could not
+//! be written down does not happen. Three before four is what keeps a refused
 //! request from leaving a record of a scan that never ran.
 //!
 //! Resolving once and judging that same answer is what keeps the check honest.
@@ -48,9 +50,38 @@ pub struct Policy<'a> {
     pub root: Option<&'a Path>,
     pub scope: &'a Scope,
     pub audit: &'a Audit,
+    /// Whether the daemon found room for this scan among however many it runs
+    /// at once. Already true or false before the request was read.
+    pub has_room: bool,
 }
 
 impl Policy<'_> {
+    /// Refuses a scan this daemon has no room to run.
+    ///
+    /// A scan is work on somebody else's network and on this machine's
+    /// interfaces, and a caller that asks for a thousand of them gets a
+    /// thousand. That is the right answer for a person at a terminal, who is
+    /// both the one asking and the one who pays for it, and the wrong one for a
+    /// daemon behind a web page, where those are different people. So it is the
+    /// operator's setting, like the scope, rather than the request's.
+    ///
+    /// The room was taken before the request was read, rather than counted when
+    /// it was. Counting is what a client defeats by asking twice at once: two
+    /// requests read together would both find the daemon idle and both start,
+    /// and a client sending a hundred would start a hundred. So the slot is
+    /// claimed first and given back when the scan it was claimed for ends, and
+    /// what arrives here is the answer rather than the question.
+    pub fn room(&self, kind: &str, targets: &[String]) -> Result<(), Error> {
+        if self.has_room {
+            return Ok(());
+        }
+
+        let refused = Error::at_capacity();
+        self.audit.refused(&refused, kind, targets)?;
+
+        Err(refused)
+    }
+
     /// Judges a scan's addresses, and writes down a refusal.
     ///
     /// `targets` is what the request said rather than what it resolved to,

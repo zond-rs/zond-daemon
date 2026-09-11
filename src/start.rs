@@ -53,6 +53,14 @@ pub async fn scan(wire: proto::StartRequest, under: Policy<'_>) -> Result<Starte
         .and_then(crate::convert::scan_kind_of)
         .unwrap_or(ScanKind::PortScan);
 
+    // Before the request is read, let alone resolved: a daemon with no room for
+    // another scan has none whatever the rest of the document turns out to say.
+    let asked_about = match kind {
+        ScanKind::Listen => &wire.links,
+        _ => &wire.targets,
+    };
+    under.room(audited_as(kind), asked_about)?;
+
     match kind {
         ScanKind::Discovery => sweep(wire, under).await,
         ScanKind::Listen => watch(wire, under).await,
@@ -60,6 +68,15 @@ pub async fn scan(wire: proto::StartRequest, under: Policy<'_>) -> Result<Starte
         // whatever the engine learns next. Asking for one this build has no
         // name for is the same as asking for nothing.
         _ => ports(wire, under).await,
+    }
+}
+
+/// What the audit calls a kind of scan.
+fn audited_as(kind: ScanKind) -> &'static str {
+    match kind {
+        ScanKind::Discovery => "discovery",
+        ScanKind::Listen => "listen",
+        _ => "port_scan",
     }
 }
 
@@ -303,6 +320,8 @@ pub async fn resume(id: &str, root: &Path, under: Policy<'_>) -> Result<Started,
     config.tcp_technique = journal.manifest().technique();
 
     let id = journal.manifest().id.clone();
+
+    under.room(audited_as(plan.kind()), std::slice::from_ref(&id))?;
 
     match plan.kind() {
         ScanKind::PortScan => {

@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::Notify;
@@ -264,6 +264,27 @@ pub struct Scans {
     scope: Scope,
     /// Where what it was pointed at is written down.
     audit: Audit,
+    /// The most scans that may run at once, and `None` for as many as asked.
+    ceiling: Option<usize>,
+    /// How many are running or on their way to running.
+    taken: Arc<AtomicUsize>,
+}
+
+/// One of the scans a daemon is willing to run at once, held for as long as the
+/// scan it was claimed for.
+///
+/// Claimed before a request is read and given back when the scan ends, which is
+/// what makes a ceiling hold. A count taken when a request arrives would be a
+/// count of scans that exist, and a scan does not exist until it has started: a
+/// client sending two together would have both counted against an idle daemon
+/// and both let through.
+#[derive(Debug)]
+struct Slot(Arc<AtomicUsize>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
 }
 
 impl Scans {
@@ -280,6 +301,8 @@ impl Scans {
             root,
             scope: Scope::anywhere(),
             audit: Audit::none(),
+            ceiling: None,
+            taken: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -298,20 +321,60 @@ impl Scans {
         self
     }
 
+    /// Caps how many scans may run at once.
+    ///
+    /// A registry told nothing runs as many as it is asked for, which is what a
+    /// scanner on somebody's own machine does. See [`Policy::room`] for why a
+    /// daemon serving other people wants a number here.
+    pub fn running_at_most(mut self, scans: Option<usize>) -> Self {
+        self.ceiling = scans;
+        self
+    }
+
     /// What every scan is held to.
-    fn policy(&self) -> Policy<'_> {
+    fn policy(&self, has_room: bool) -> Policy<'_> {
         Policy {
             root: self.root.as_deref(),
             scope: &self.scope,
             audit: &self.audit,
+            has_room,
+        }
+    }
+
+    /// Claims one of the slots the ceiling allows, or nothing if there are none.
+    ///
+    /// A daemon with no ceiling still claims, so that what is running is counted
+    /// the one way whether or not anybody set a number on it.
+    fn reserve(&self) -> Option<Slot> {
+        let ceiling = self.ceiling.unwrap_or(usize::MAX);
+        let mut taken = self.taken.load(Ordering::Acquire);
+
+        loop {
+            if taken >= ceiling {
+                return None;
+            }
+
+            match self.taken.compare_exchange_weak(
+                taken,
+                taken + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Slot(self.taken.clone())),
+                Err(current) => taken = current,
+            }
         }
     }
 
     /// Starts a scan and files it under a name of its own.
     pub async fn start(&self, request: proto::StartRequest) -> Result<Arc<Scan>, Error> {
-        let started = crate::start::scan(request, self.policy()).await?;
+        // Claimed before the request is read and dropped on any way out of here
+        // that is not a running scan, so nothing that failed to start goes on
+        // occupying room.
+        let slot = self.reserve();
+        let started = crate::start::scan(request, self.policy(slot.is_some())).await?;
 
-        Ok(self.file(started))
+        Ok(self.file(started, slot))
     }
 
     /// Continues a scan that stopped part way.
@@ -323,13 +386,14 @@ impl Scans {
             return Err(Error::no_such_scan(id));
         };
 
-        let started = crate::start::resume(id, root, self.policy()).await?;
+        let slot = self.reserve();
+        let started = crate::start::resume(id, root, self.policy(slot.is_some())).await?;
 
-        Ok(self.file(started))
+        Ok(self.file(started, slot))
     }
 
     /// Files a started scan under its name and sets its follower going.
-    fn file(&self, started: Started) -> Arc<Scan> {
+    fn file(&self, started: Started, slot: Option<Slot>) -> Arc<Scan> {
         let scan = Arc::new(started.scan);
 
         self.inner
@@ -337,7 +401,7 @@ impl Scans {
             .unwrap_or_else(|e| e.into_inner())
             .insert(scan.id.clone(), scan.clone());
 
-        follow(scan.clone(), started.events, started.task);
+        follow(scan.clone(), started.events, started.task, slot);
 
         scan
     }
@@ -591,7 +655,7 @@ impl Recorded {
 /// It is the only consumer, so the engine's channel never has a slow reader to
 /// drop events for. What it appends to the log is what a client eventually sees,
 /// and it goes on until the scan ends whether or not anybody is watching.
-fn follow(scan: Arc<Scan>, mut events: ScanEvents, task: ScanTask) {
+fn follow(scan: Arc<Scan>, mut events: ScanEvents, task: ScanTask, slot: Option<Slot>) {
     let log = scan.log.clone();
     let options = ExportOptions::new().with_redaction(scan.redaction);
 
@@ -655,6 +719,10 @@ fn follow(scan: Arc<Scan>, mut events: ScanEvents, task: ScanTask) {
             cause: cause as i32,
         }));
         log.close();
+
+        // Given back here and nowhere else: this is the one point every scan
+        // reaches, however it ended.
+        drop(slot);
     });
 }
 
@@ -1172,6 +1240,78 @@ mod tests {
             "it ran out of work rather than being stopped"
         );
         assert_eq!(state.seq, followed.len() as u64, "the log is what was read");
+    }
+
+    /// A ceiling is a refusal, not a queue: a caller is told there is no room
+    /// rather than left holding a call that might be answered later.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_daemon_at_its_ceiling_refuses_rather_than_queues() {
+        let scans = Scans::default().running_at_most(Some(1));
+        let first = scans.start(loopback()).await.expect("the first scan");
+
+        assert!(first.state().running, "it has only just started");
+
+        let refused = scans
+            .start(loopback())
+            .await
+            .expect_err("a second scan, with the one slot taken");
+
+        assert_eq!(refused.code(), "scan.at_capacity");
+
+        first.stop();
+    }
+
+    /// The one a count gets wrong, and the reason the room is claimed rather
+    /// than counted: two requests read together find the daemon idle, and a
+    /// client that sends a hundred at once would start a hundred.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_requests_arriving_together_do_not_both_find_the_last_slot() {
+        let scans = Scans::default().running_at_most(Some(1));
+
+        let (first, second) = tokio::join!(scans.start(loopback()), scans.start(loopback()));
+
+        let started = [&first, &second]
+            .into_iter()
+            .filter(|got| got.is_ok())
+            .count();
+        assert_eq!(started, 1, "one slot, one scan: {first:?} {second:?}");
+
+        let refused = [first.as_ref(), second.as_ref()]
+            .into_iter()
+            .find_map(|got| got.err())
+            .expect("the other one");
+        assert_eq!(refused.code(), "scan.at_capacity");
+
+        for scan in [first, second].into_iter().flatten() {
+            scan.stop();
+        }
+    }
+
+    /// The ceiling counts what is running, not what has ever run. A daemon that
+    /// filled up permanently after its first scan would be worse than one with
+    /// no ceiling at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_finished_scan_leaves_room_for_the_next() {
+        let scans = Scans::default().running_at_most(Some(1));
+        let first = scans.start(loopback()).await.expect("the first scan");
+
+        finished(&first).await;
+
+        scans
+            .start(loopback())
+            .await
+            .expect("the slot the first scan gave back");
+    }
+
+    /// A daemon told nothing runs as many as it is asked for.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_daemon_with_no_ceiling_runs_what_it_is_asked_to() {
+        let scans = Scans::default();
+        let first = scans.start(loopback()).await.expect("the first scan");
+        let second = scans.start(loopback()).await.expect("the second scan");
+
+        first.stop();
+        second.stop();
     }
 
     /// A follower that joins late is caught up rather than replayed to.

@@ -1,0 +1,8 @@
+# The build context is the directory holding both repositories, so this is what
+# is skipped in either of them.
+**/target
+**/.git
+**/.github
+**/.idea
+**/fuzz
+**/audit

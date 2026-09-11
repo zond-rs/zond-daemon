@@ -23,8 +23,20 @@
 //! The socket is created readable and writable by its owner and nobody else.
 //! That is the right default for a process that can put arbitrary packets on the
 //! wire, and it is deliberately inconvenient: sharing it with another container
-//! is something an operator does on purpose, by running both as the same user or
-//! by widening the mode on the directory it sits in.
+//! is something an operator does on purpose.
+//!
+//! Which is what a group is for. Named one, the socket is given to it and opened
+//! to it, and the unprivileged process on the other end joins that group instead
+//! of being run as this one's user. That matters because this process holds
+//! `NET_RAW` and usually runs as root, so "the same user" means running a web
+//! server as root to let it open a socket — the opposite of what the split was
+//! drawn for.
+//!
+//! A numeric group id rather than a name. A name has to be one this process can
+//! look up, which means one in its own container's `/etc/group`, and a container
+//! built to run a scanner has no reason to carry the web tier's groups. The
+//! number is also what a container runtime speaks: it is the `group_add` and the
+//! `user:` that put the other process in the group.
 //!
 //! Every connection is served by the same [`Scans`], so a scan started on one is
 //! watched from another, and a client that drops its connection leaves the scan
@@ -44,9 +56,16 @@ use crate::stdio::speak;
 /// Only the user running the daemon.
 const SOCKET_MODE: u32 = 0o600;
 
+/// That user, and the one group the operator named.
+const SHARED_MODE: u32 = 0o660;
+
 /// Serves the protocol on `path` until the process is told to stop.
-pub async fn serve(scans: Arc<Scans>, path: &Path) -> io::Result<()> {
-    let listener = bind(path)?;
+///
+/// `group` is a numeric group id the socket is also opened to, and `None` keeps
+/// it to the user running this process. See the module documentation for why
+/// that is a number.
+pub async fn serve(scans: Arc<Scans>, path: &Path, group: Option<u32>) -> io::Result<()> {
+    let listener = bind(path, group)?;
     let _cleanup = Socket(path.to_path_buf());
 
     loop {
@@ -72,7 +91,7 @@ async fn converse(scans: Arc<Scans>, stream: UnixStream) -> io::Result<()> {
 /// worth refusing, or one that is not, which is litter. Connecting to it is how
 /// the two are told apart: a refused connection means nobody is listening, and
 /// only then is the file removed.
-fn bind(path: &Path) -> io::Result<UnixListener> {
+fn bind(path: &Path, group: Option<u32>) -> io::Result<UnixListener> {
     if path.exists() {
         match std::os::unix::net::UnixStream::connect(path) {
             Ok(_) => {
@@ -94,6 +113,13 @@ fn bind(path: &Path) -> io::Result<UnixListener> {
     // wider mode, which is why the directory the socket sits in is the thing to
     // get right rather than this.
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(SOCKET_MODE))?;
+
+    // Given away before it is opened up, so there is no moment where a group
+    // that was not named can reach it.
+    if let Some(gid) = group {
+        std::os::unix::fs::chown(path, None, Some(gid))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(SHARED_MODE))?;
+    }
 
     Ok(listener)
 }
@@ -130,6 +156,49 @@ mod tests {
         std::env::temp_dir().join(format!("zondd-{}.sock", crate::id::mint()))
     }
 
+    /// The group this process is in, read off a file it just made rather than
+    /// asked for through `libc`, which this crate does not depend on. Chowning
+    /// to a group one is already in is the one case that needs no privilege, so
+    /// it is the only one a test can make.
+    fn own_group(near: &Path) -> u32 {
+        use std::os::unix::fs::MetadataExt;
+
+        let scratch = near.with_extension("group");
+        std::fs::write(&scratch, b"").expect("a file in the temporary directory");
+        let gid = std::fs::metadata(&scratch).expect("its metadata").gid();
+        let _ = std::fs::remove_file(&scratch);
+
+        gid
+    }
+
+    /// Named a group, the socket is given to it and opened to it, which is what
+    /// lets an unprivileged process on the other end reach a daemon holding
+    /// `NET_RAW`.
+    #[tokio::test]
+    async fn a_socket_given_a_group_is_reachable_by_it() {
+        use std::os::unix::fs::MetadataExt;
+
+        let path = somewhere();
+        let group = own_group(&path);
+
+        let _listener = bind(&path, Some(group)).expect("a socket");
+        let _cleanup = Socket(path.clone());
+
+        let about = std::fs::metadata(&path).expect("its metadata");
+
+        assert_eq!(
+            about.gid(),
+            group,
+            "it belongs to the group it was given to"
+        );
+        assert_eq!(
+            about.permissions().mode() & 0o777,
+            SHARED_MODE,
+            "{:o}",
+            about.permissions().mode() & 0o777
+        );
+    }
+
     /// Starts a daemon and waits until it answers.
     ///
     /// Waits for a connection rather than for the path to exist. A socket a dead
@@ -139,7 +208,7 @@ mod tests {
     async fn listening(path: &Path) -> JoinHandle<io::Result<()>> {
         let serving = tokio::spawn({
             let path = path.to_path_buf();
-            async move { serve(Arc::new(Scans::default()), &path).await }
+            async move { serve(Arc::new(Scans::default()), &path, None).await }
         });
 
         for _ in 0..500 {
@@ -264,7 +333,7 @@ mod tests {
         let path = somewhere();
         let serving = listening(&path).await;
 
-        let refused = serve(Arc::new(Scans::default()), &path)
+        let refused = serve(Arc::new(Scans::default()), &path, None)
             .await
             .expect_err("a second daemon on one socket");
 

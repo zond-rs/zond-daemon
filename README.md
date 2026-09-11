@@ -68,7 +68,11 @@ says where; `--no-journal` means scans that die with the process.
 The socket is created readable and writable by the user running the daemon and
 nobody else. A process that can put arbitrary packets on the wire is not one to
 hand to every account on the machine, so sharing it with another container is
-something an operator does on purpose.
+something an operator does on purpose — which is what `--socket-group` is. Named
+a numeric group id, the socket is given to that group and opened to it, and the
+front end joins the group instead of being run as this process's user. That is
+the difference between an unprivileged front end and one running as root to open
+a socket, since a daemon holding `NET_RAW` usually is root.
 
 ## Bounding it
 
@@ -97,6 +101,12 @@ per line. It fails closed: where a log is named and cannot be written, the scan 
 refused, a scan nobody can account for being the one outcome an audit exists to
 prevent.
 
+`--max-concurrent` is how many scans it will run at once, and a request arriving
+when that many are running is refused rather than queued. A person at a terminal
+is their own ceiling: they ask for one scan because they are waiting for it. A
+front end serving other people is not, and whoever asks it for a hundred scans is
+not the one who pays for them.
+
 ```json
 {"at":"2026-09-11T17:17:49Z","event":"started","kind":"port_scan","scan_id":"0384HF6YZY000","targets":["127.0.0.1"]}
 {"at":"2026-09-11T17:17:49Z","event":"refused","code":"scope.refused","targets":["192.0.2.0/24"],"detail":"…"}
@@ -104,12 +114,26 @@ prevent.
 
 ## In a container
 
-[`deploy/compose.yaml`](deploy/compose.yaml) has the shape, and the two things
+```bash
+docker run --network host --cap-drop ALL --cap-add NET_RAW --cap-add NET_ADMIN \
+  -v zond:/run/zond ghcr.io/zond-rs/zond-daemon:0.1.0 --listen /run/zond/zond.sock
+```
+
+[`deploy/compose.yaml`](deploy/compose.yaml) has the shape, and the three things
 people get wrong. The scanner needs the host's own network, because a container
 on a bridge network has no layer 2 to the LAN and resolves `lan` to its own
-subnet. And it needs raw sockets, which nothing else does: whatever a person
-talks to holds no capabilities at all and reaches the daemon through a socket in
-a shared volume, which is where the policy is enforced.
+subnet. It needs raw sockets, which nothing else does: whatever a person talks to
+holds no capabilities at all and reaches the daemon through a socket in a shared
+volume, which is where the policy is enforced. And those two make the daemon
+root, so the socket goes to a group the front end is in rather than to the user
+the front end would then have to be.
+
+Building the image rather than pulling it is a build whose context holds both
+repositories, this crate naming the engine at `../zond-engine`:
+
+```bash
+docker build -f zond-daemon/Dockerfile -t zond-daemon:0.1.0 .
+```
 
 ## Examples
 

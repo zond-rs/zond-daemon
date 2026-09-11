@@ -33,6 +33,13 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     listen: Option<PathBuf>,
 
+    /// Open the socket to this group as well, as a numeric group id, for the
+    /// unprivileged process that talks to this one. A number rather than a name
+    /// because a name would have to exist in this daemon's own container, and a
+    /// number is what a container runtime speaks.
+    #[arg(long, value_name = "GID", requires = "listen")]
+    socket_group: Option<u32>,
+
     /// Write scans down under this directory, so they outlive the process and
     /// can be read back by name. Defaults to this user's own journal directory.
     #[arg(long, value_name = "PATH")]
@@ -58,6 +65,11 @@ struct Args {
     /// JSON object per line. A scan that cannot be written down is refused.
     #[arg(long, value_name = "PATH")]
     audit: Option<PathBuf>,
+
+    /// Run at most this many scans at once, refusing a request that arrives
+    /// when that many are running. Unset runs as many as it is asked for.
+    #[arg(long, value_name = "N")]
+    max_concurrent: Option<usize>,
 }
 
 #[tokio::main]
@@ -104,13 +116,18 @@ async fn main() -> ExitCode {
         eprintln!("zondd: scans are bounded by the ranges named on the command line");
     }
 
-    let scans = Arc::new(Scans::recording_in(root).within(scope).auditing(audit));
+    let scans = Arc::new(
+        Scans::recording_in(root)
+            .within(scope)
+            .auditing(audit)
+            .running_at_most(args.max_concurrent),
+    );
 
     // Neither, rather than a default: a daemon that opens something unasked is a
     // daemon nobody asked for, and which of the two a caller wants is not
     // something to guess at.
     let served = match (&args.listen, args.stdio) {
-        (Some(path), _) => zond_daemon::listen::serve(scans, path).await,
+        (Some(path), _) => zond_daemon::listen::serve(scans, path, args.socket_group).await,
         (None, true) => zond_daemon::stdio::serve(scans).await,
         (None, false) => {
             eprintln!(

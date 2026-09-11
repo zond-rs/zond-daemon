@@ -1,4 +1,4 @@
-# The shape a deployment takes, and the two things people get wrong.
+# The shape a deployment takes, and the three things people get wrong.
 #
 # 1. The scanner needs the host's own network. A container on a bridge network
 #    has no layer 2 to the LAN: it cannot ARP or NDP, and `lan` resolves to the
@@ -8,11 +8,17 @@
 #    runs with no capabilities at all, and reaches the scanner through a socket
 #    in a shared volume.
 #
-# This file describes running the daemon, not building it. `image:` is whatever
-# you build or publish it as.
+# 3. Those two put the daemon on the wrong side of a permission. It holds
+#    `NET_RAW` and so runs as root, and a socket only its owner can open is one
+#    the front end would have to be root to reach — which is the opposite of
+#    what the split was drawn for. So the socket is given to a group, and the
+#    front end runs as an ordinary user who is in it.
+#
+# This file describes running the daemon, not building it. See the `Dockerfile`
+# beside this directory for that.
 services:
   zondd:
-    image: zond-daemon:latest
+    image: ghcr.io/zond-rs/zond-daemon:0.1.0
     # The host's own network, which is the whole point. Without it the scanner
     # sees a container's idea of the network instead of the network.
     network_mode: host
@@ -28,10 +34,18 @@ services:
     command:
       - --listen=/run/zond/zond.sock
       - --journal-dir=/var/lib/zond
+      # The group the front end below runs as, so it can open the socket
+      # without being this container's user. A number, because a name would
+      # have to exist in this container and there is no reason for it to.
+      - --socket-group=1000
       # Where this daemon may be pointed, and where that is written down. Both
       # are off unless named: say what yours should be.
       - --allow=10.0.0.0/8
       - --audit=/var/lib/zond/audit.jsonl
+      # How many scans it will run at once. A person at a terminal is their own
+      # ceiling; a front end serving other people is not, so this is where the
+      # number goes.
+      - --max-concurrent=4
     volumes:
       - socket:/run/zond
       - journals:/var/lib/zond
@@ -41,6 +55,9 @@ services:
   # the daemon through the socket, which is where the policy is enforced.
   client:
     image: your-front-end:latest
+    # An ordinary user, in the group the socket was given to. This is the half
+    # that makes `--socket-group` above mean anything.
+    user: "1000:1000"
     cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true

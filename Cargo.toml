@@ -28,7 +28,7 @@ thiserror = "2.0.20"
 # standard-output halves the first transport reads and writes.
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "sync", "signal", "time", "net"] }
 tracing = "0.1.44"
-zond-engine = { version = "0.15.0", path = "../zond-engine", features = [
+zond-engine = { version = "0.15.0", features = [
     "import-request",
     "import-settings",
     # Every format the engine can write, because a scan nobody can get results

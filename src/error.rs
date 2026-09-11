@@ -52,6 +52,14 @@ impl Error {
         Self::new("scan.unknown", format!("no scan is named {id}"))
     }
 
+    /// More scans at once than this daemon was told to run.
+    pub fn at_capacity() -> Self {
+        Self::new(
+            "scan.at_capacity",
+            "this daemon is already running as many scans at once as it runs",
+        )
+    }
+
     /// A method this build does not have.
     pub fn no_such_method(method: &str) -> Self {
         Self::new("rpc.unknown_method", format!("no method named {method}"))
